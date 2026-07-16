@@ -1,0 +1,101 @@
+name: Trading bot
+
+on:
+  schedule:
+    # Times below are UTC and tuned for US market hours in EDT (UTC-4, roughly
+    # mid-March to early November). During EST (UTC-5, winter), each run lands
+    # one hour earlier in New York time:
+    #   13:40 UTC -> 09:40 EDT (10 min after open) | 08:40 EST (pre-open)
+    #   17:00 UTC -> 13:00 EDT (midday)             | 12:00 EST (still mid-session)
+    #   19:45 UTC -> 15:45 EDT (15 min before close) | 14:45 EST (still mid-session)
+    # GitHub Actions cron does not follow DST, so the 13:40 slot fires before
+    # the open for roughly half the year. This is a wasted run, not an unsafe
+    # one: bot/execute.py refuses every order when TradingClient.get_clock()
+    # reports the market closed, so a mistimed trigger just no-ops. Adjust
+    # these three values by an hour around the March/November DST changes if
+    # tighter alignment to the open/midday/pre-close windows is needed.
+    - cron: "40 13 * * 1-5"
+    - cron: "0 17 * * 1-5"
+    - cron: "45 19 * * 1-5"
+  workflow_dispatch: {}
+
+# Queue overlapping runs instead of cancelling or running concurrently: two
+# runs racing each other could both pass the "already held" check in
+# bot/main.py before either submits an order, producing a duplicate buy.
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check kill switch
+        id: killswitch
+        run: |
+          if [ "${{ vars.TRADING_ENABLED }}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KILL_SWITCH — repo variable TRADING_ENABLED is not 'true' (got '${{ vars.TRADING_ENABLED }}'). Skipping bot run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run bot
+        if: steps.killswitch.outputs.enabled == 'true'
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python -m bot.main
+
+      - name: Commit logs
+        if: always() && steps.killswitch.outputs.enabled == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f logs/journal.jsonl logs/run_history.log 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "No log changes to commit."
+          else
+            git commit -m "Log bot run: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 -c "
+          import json
+          try:
+              with open('logs/journal.jsonl') as f:
+                  lines = [l for l in f if l.strip()]
+              rec = json.loads(lines[-1])
+              tb = rec.get('traceback', 'No traceback field in latest journal entry.')
+          except Exception as e:
+              tb = f'Could not read logs/journal.jsonl: {e}'
+          with open('issue_traceback.txt', 'w') as f:
+              f.write(tb)
+          "
+          printf 'Scheduled/manual run failed.\n\nRun: %s\n\n```\n' "$RUN_URL" > issue_body.md
+          cat issue_traceback.txt >> issue_body.md
+          printf '\n```\n' >> issue_body.md
+          gh issue create \
+            --title "Trading bot run failed: $(date -u +'%Y-%m-%d %H:%M UTC')" \
+            --body-file issue_body.md
