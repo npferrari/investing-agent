@@ -1,3 +1,4 @@
 2026-07-16T09:59:50.764806+00:00 env=paper regime=RISK_ON symbols=46 buys_submitted=0 buys_rejected=2 buys_skipped_held=2 positions=3 equity=100014.78
 2026-07-16T15:20:50.739918+00:00 env=paper regime=RISK_ON symbols=46 buys_submitted=3 buys_rejected=0 buys_skipped_held=0 positions=3 equity=100043.50
 2026-07-16T18:13:14.586298+00:00 env=paper regime=RISK_ON symbols=46 buys_submitted=0 buys_rejected=0 buys_skipped_held=3 positions=6 equity=100054.83
+2026-07-16T20:35:45.725031+00:00 env=paper regime=MIXED symbols=46 buys_submitted=0 buys_rejected=0 buys_skipped_held=3 positions=6 equity=100056.72
