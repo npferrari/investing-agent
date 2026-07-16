@@ -1,0 +1,5 @@
+alpaca-py>=0.43.5
+anthropic>=0.116.0
+python-dotenv>=1.2.2
+pandas>=3.0.3
+numpy>=2.5.1
