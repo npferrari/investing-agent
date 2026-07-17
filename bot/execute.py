@@ -14,9 +14,9 @@ _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 _ALL_SYMBOLS = set(UNIVERSE["STOCKS"]) | set(UNIVERSE["ETFS"]) | set(UNIVERSE["HEDGE"])
 
-MAX_OPEN_POSITIONS = 14
-MAX_PCT_PER_TICKER = 0.12
-MAX_PCT_PER_SECTOR = 0.25
+MAX_OPEN_POSITIONS = 8
+MAX_PCT_PER_TICKER = 0.15
+MAX_PCT_PER_SECTOR = 0.30
 
 # Every position is currently attributed to this sleeve — execute_order
 # doesn't yet support issuing BUYs under any other sleeve, and there is no
@@ -65,24 +65,38 @@ def execute_order(symbol, action, usd_amount, sleeve):
     if not price or price <= 0:
         return _reject(symbol, action, usd_amount, sleeve, "no valid quote available", quote_log)
 
-    qty = math.floor(usd_amount / price)
-    if qty < 1:
-        return _reject(
-            symbol,
-            action,
-            usd_amount,
-            sleeve,
-            f"${usd_amount:.2f} buys less than one whole share at ${price:.2f}",
-            quote_log,
-        )
+    # Prefer a notional (dollar-denominated) market order so position size
+    # tracks usd_amount exactly. Alpaca rejects notional orders for
+    # non-fractionable instruments, so fall back to a whole-share qty order
+    # for those.
+    asset = _trading_client.get_asset(symbol)
+    notional = None
+    qty = None
+    if asset.fractionable:
+        notional = round(usd_amount, 2)
+        order_value = notional
+    else:
+        qty = math.floor(usd_amount / price)
+        if qty < 1:
+            return _reject(
+                symbol,
+                action,
+                usd_amount,
+                sleeve,
+                f"{symbol} is not fractionable and ${usd_amount:.2f} buys less than "
+                f"one whole share at ${price:.2f}",
+                quote_log,
+            )
+        order_value = qty * price
 
     positions = _trading_client.get_all_positions()
     held_symbols = {p.symbol for p in positions}
 
     if action == "BUY":
-        account = _trading_client.get_account()
-        equity = float(account.equity)
-        order_value = qty * price
+        # Caps are checked against live account equity fetched fresh here,
+        # never a hardcoded balance, since the paper account's equity can
+        # change (deposits, resets, prior fills) between runs.
+        equity = get_equity()
 
         if symbol not in held_symbols and len(positions) >= MAX_OPEN_POSITIONS:
             return _reject(
@@ -124,20 +138,23 @@ def execute_order(symbol, action, usd_amount, sleeve):
                     quote_log,
                 )
 
+    # notional and qty are mutually exclusive on MarketOrderRequest; exactly
+    # one is set above depending on whether the asset is fractionable.
     order_request = MarketOrderRequest(
         symbol=symbol,
         qty=qty,
+        notional=notional,
         side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
         time_in_force=TimeInForce.DAY,
     )
     order = _trading_client.submit_order(order_request)
 
     logger.info(
-        "SUBMITTED %s %s qty=%d (~$%.2f, sleeve=%s) bid=%.2f ask=%.2f order_id=%s",
+        "SUBMITTED %s %s %s (~$%.2f, sleeve=%s) bid=%.2f ask=%.2f order_id=%s",
         action,
         symbol,
-        qty,
-        qty * price,
+        f"notional=${notional:.2f}" if notional is not None else f"qty={qty}",
+        order_value,
         sleeve,
         quote.bid_price,
         quote.ask_price,
@@ -149,6 +166,8 @@ def execute_order(symbol, action, usd_amount, sleeve):
         "symbol": symbol,
         "action": action,
         "qty": qty,
+        "notional": notional,
+        "order_value": order_value,
         "usd_amount": usd_amount,
         "sleeve": sleeve,
         "quote": quote_log,

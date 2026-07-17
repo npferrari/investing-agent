@@ -4,13 +4,13 @@ import traceback
 
 from bot.config import UNIVERSE
 from bot.data import get_daily_bars
-from bot.execute import execute_order, get_positions
+from bot.execute import execute_order, get_equity, get_positions
 from bot.journal import journal_error, journal_run
 from bot.signals import generate_signal, get_indicators, get_regime
 
 logger = logging.getLogger("bot.main")
 
-BUY_USD_AMOUNT = 1000
+POSITION_SIZE_PCT = 0.06
 SLEEVE = "TACTICAL"
 
 
@@ -30,6 +30,11 @@ def _skip_already_held(symbol, usd_amount, sleeve):
 def _run():
     symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
     held_symbols = {p.symbol for p in get_positions()}
+
+    # Sized off live account equity, not a hardcoded dollar figure, so this
+    # tracks deposits/withdrawals/resets on the paper account automatically.
+    buy_usd_amount = get_equity() * POSITION_SIZE_PCT
+
     bars = get_daily_bars(symbols, days=250)
 
     indicators = get_indicators(bars)
@@ -57,17 +62,18 @@ def _run():
 
         if signal == "BUY":
             if symbol in held_symbols:
-                results.append(_skip_already_held(symbol, BUY_USD_AMOUNT, SLEEVE))
+                results.append(_skip_already_held(symbol, buy_usd_amount, SLEEVE))
             else:
-                results.append(execute_order(symbol, "BUY", BUY_USD_AMOUNT, SLEEVE))
+                results.append(execute_order(symbol, "BUY", buy_usd_amount, SLEEVE))
 
     print("\nExecution summary:")
     if not results:
         print("  no BUY signals fired")
     for r in results:
         if r["status"] == "SUBMITTED":
+            size = f"notional=${r['notional']:.2f}" if r["notional"] is not None else f"qty={r['qty']}"
             print(
-                f"  {r['symbol']:<6} SUBMITTED qty={r['qty']} "
+                f"  {r['symbol']:<6} SUBMITTED {size} "
                 f"bid={r['quote']['bid']:.2f} ask={r['quote']['ask']:.2f} order_id={r['order_id']}"
             )
         elif r["status"] == "SKIPPED_ALREADY_HELD":
