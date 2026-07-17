@@ -5,8 +5,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, SECTOR_MAP, UNIVERSE
+from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, DEFAULT_SLEEVE, RISK, SECTOR_MAP, UNIVERSE
 from bot.data import get_latest_quote
+from bot.journal import get_ramp_cap_pct, read_entries
 
 logger = logging.getLogger("bot.execute")
 
@@ -14,14 +15,9 @@ _trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 
 _ALL_SYMBOLS = set(UNIVERSE["STOCKS"]) | set(UNIVERSE["ETFS"]) | set(UNIVERSE["HEDGE"])
 
-MAX_OPEN_POSITIONS = 8
-MAX_PCT_PER_TICKER = 0.15
-MAX_PCT_PER_SECTOR = 0.30
-
-# Every position is currently attributed to this sleeve — execute_order
-# doesn't yet support issuing BUYs under any other sleeve, and there is no
-# persisted per-position sleeve store, so a mixed-sleeve book can't yet exist.
-DEFAULT_SLEEVE = "TACTICAL"
+MAX_OPEN_POSITIONS = RISK["max_positions"]
+MAX_PCT_PER_TICKER = RISK["max_ticker_pct"] / 100
+MAX_PCT_PER_SECTOR = RISK["max_sector_pct"] / 100
 
 
 def get_positions():
@@ -138,6 +134,24 @@ def execute_order(symbol, action, usd_amount, sleeve):
                     quote_log,
                 )
 
+        # deploy_ramp caps total invested % of equity by account-age week,
+        # so a young account can't go all-in immediately. Cap is read fresh
+        # from journal history every call, not cached, since account age
+        # advances and week boundaries roll over between runs.
+        ramp_cap_pct = get_ramp_cap_pct(read_entries())
+        invested_value = sum(float(p.market_value) for p in positions)
+        invested_after = invested_value + order_value
+        if invested_after > (ramp_cap_pct / 100) * equity:
+            return _reject(
+                symbol,
+                action,
+                usd_amount,
+                sleeve,
+                f"RAMP_LIMIT: would push total invested to ${invested_after:.2f} "
+                f"(cap is {ramp_cap_pct}% of ${equity:.2f} equity)",
+                quote_log,
+            )
+
     # notional and qty are mutually exclusive on MarketOrderRequest; exactly
     # one is set above depending on whether the asset is fractionable.
     order_request = MarketOrderRequest(
@@ -173,3 +187,31 @@ def execute_order(symbol, action, usd_amount, sleeve):
         "quote": quote_log,
         "order_id": str(order.id),
     }
+
+
+def stop_loss_sweep():
+    """SELL any open position breaching its sleeve's stop-loss threshold.
+
+    Runs every cycle unconditionally, including when circuit breakers have
+    the account in DEFENSIVE MODE — a stop-loss is risk-reducing, so it must
+    never be blocked by a freeze that only gates new BUYs.
+    """
+    results = []
+    for position in _trading_client.get_all_positions():
+        sleeve = DEFAULT_SLEEVE
+        stop_pct = RISK[f"stop_{sleeve.lower()}_pct"]
+        unrealized_pct = float(position.unrealized_plpc) * 100
+        if unrealized_pct > stop_pct:
+            continue
+
+        logger.warning(
+            "STOP_LOSS %s unrealized=%.2f%% <= stop=%.2f%% (sleeve=%s) — selling",
+            position.symbol,
+            unrealized_pct,
+            stop_pct,
+            sleeve,
+        )
+        # Sell the full position: usd_amount is its current market value, so
+        # the notional/qty logic above closes it out rather than trimming it.
+        results.append(execute_order(position.symbol, "SELL", float(position.market_value), sleeve))
+    return results
