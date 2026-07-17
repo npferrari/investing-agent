@@ -67,13 +67,37 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add -f logs/journal.jsonl logs/run_history.log 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No log changes to commit."
-          else
-            git commit -m "Log bot run: $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
+            exit 0
           fi
+          git commit -m "Log bot run: $(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          # git pull --rebase needs a clean working tree, so this only runs
+          # after our own changes are committed — never before. .gitattributes
+          # declares merge=union for logs/*.jsonl and logs/*.log, so a
+          # concurrent run's appended lines merge cleanly on rebase instead
+          # of conflicting. A rejected push means another run landed between
+          # our pull and our push; retry with a fresh pull --rebase up to 3
+          # attempts total.
+          git pull --rebase origin main
+          attempt=1
+          max_attempts=3
+          while true; do
+            if git push origin main; then
+              echo "Pushed logs on attempt $attempt."
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::Push rejected after $max_attempts attempts — giving up."
+              exit 1
+            fi
+            echo "Push rejected (attempt $attempt/$max_attempts) — pulling and retrying..."
+            git pull --rebase origin main
+            attempt=$((attempt + 1))
+          done
 
       - name: Open issue on failure
         if: failure()

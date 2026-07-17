@@ -1,0 +1,2 @@
+logs/*.jsonl merge=union
+logs/*.log merge=union
