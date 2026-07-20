@@ -2,12 +2,15 @@ name: Trading bot
 
 on:
   schedule:
-    # Times below are UTC and tuned for US market hours in EDT (UTC-4, roughly
+    # Times below are UTC, off-the-hour to dodge GitHub's queue congestion at
+    # :00/:15/:30/:45, and tuned for US market hours in EDT (UTC-4, roughly
     # mid-March to early November). During EST (UTC-5, winter), each run lands
     # one hour earlier in New York time:
     #   13:40 UTC -> 09:40 EDT (10 min after open) | 08:40 EST (pre-open)
-    #   17:00 UTC -> 13:00 EDT (midday)             | 12:00 EST (still mid-session)
-    #   19:45 UTC -> 15:45 EDT (15 min before close) | 14:45 EST (still mid-session)
+    #   16:53 UTC -> 12:53 EDT (midday)             | 11:53 EST (still mid-session)
+    #   19:12 UTC -> 15:12 EDT (48 min before close) | 14:12 EST (still mid-session)
+    # The pre-close slot is deliberately kept >=45 min ahead of the 20:00 UTC
+    # (EDT) close so a delayed/queued run still lands before the bell.
     # GitHub Actions cron does not follow DST, so the 13:40 slot fires before
     # the open for roughly half the year. This is a wasted run, not an unsafe
     # one: bot/execute.py refuses every order when TradingClient.get_clock()
@@ -15,8 +18,8 @@ on:
     # these three values by an hour around the March/November DST changes if
     # tighter alignment to the open/midday/pre-close windows is needed.
     - cron: "40 13 * * 1-5"
-    - cron: "0 17 * * 1-5"
-    - cron: "45 19 * * 1-5"
+    - cron: "53 16 * * 1-5"
+    - cron: "12 19 * * 1-5"
   workflow_dispatch: {}
 
 # Queue overlapping runs instead of cancelling or running concurrently: two
