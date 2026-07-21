@@ -7,3 +7,4 @@
 2026-07-20T20:40:18.525380+00:00 env=paper regime=MIXED breaker=TRADING_OK symbols=46 submitted=0 rejected=0 skipped=0 positions=0 equity=5000.00
 2026-07-21T15:24:43.581025+00:00 env=paper regime=RISK_ON breaker=TRADING_OK symbols=46 submitted=0 rejected=0 skipped=0 positions=0 equity=5000.00
 2026-07-21T18:06:10.283684+00:00 env=paper regime=RISK_ON breaker=TRADING_OK symbols=46 submitted=0 rejected=0 skipped=0 positions=0 equity=5000.00
+2026-07-21T20:36:07.424443+00:00 env=paper regime=RISK_ON breaker=TRADING_OK symbols=46 submitted=0 rejected=0 skipped=0 positions=0 equity=5000.00
