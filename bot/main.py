@@ -1,3 +1,4 @@
+import argparse
 import logging
 import sys
 import traceback
@@ -7,6 +8,7 @@ from bot.config import RISK, UNIVERSE
 from bot.data import get_daily_bars
 from bot.execute import execute_order, get_equity, get_positions, stop_loss_sweep
 from bot.journal import count_trades_today, journal_error, journal_run, read_entries, symbols_in_cooldown
+from bot.news import get_macro_headlines, get_ticker_headlines
 from bot.signals import generate_signal, get_indicators, get_regime
 
 logger = logging.getLogger("bot.main")
@@ -146,8 +148,59 @@ def _run():
     journal_run(regime, analyzed, results, final_positions, final_equity, breaker_status)
 
 
+# Rough chars-per-token heuristic (~4:1 for English prose), good enough to
+# spot budget drift (§5) without pulling in a tokenizer just to print a debug view.
+def _estimate_tokens(text):
+    return round(len(text) / 4)
+
+
+def _print_headline_line(headline):
+    line = f"{headline['title']} | {headline['age_hours']}h | {headline['source']}"
+    print(f"    {line}  (~{_estimate_tokens(line)} tok)")
+    return _estimate_tokens(line)
+
+
+def _print_news():
+    symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
+
+    print("=== Ticker headlines (last 24h, cap 5/ticker) ===")
+    ticker_headlines = get_ticker_headlines(symbols, hours=24, cap=5)
+    ticker_tokens = 0
+    quiet_count = 0
+    for symbol, headlines in ticker_headlines.items():
+        if not headlines:
+            quiet_count += 1
+            continue
+        print(f"  {symbol}:")
+        for headline in headlines:
+            ticker_tokens += _print_headline_line(headline)
+    print(f"  ({quiet_count}/{len(symbols)} tickers with no headlines in window)")
+    print(f"  subtotal: ~{ticker_tokens} tok (summaries excluded from this estimate — prompt-excluded by default)\n")
+
+    print("=== Macro headlines (last 24h, cap 8) ===")
+    macro_headlines = get_macro_headlines(hours=24, cap=8)
+    macro_tokens = 0
+    for headline in macro_headlines:
+        macro_tokens += _print_headline_line(headline)
+    print(f"  subtotal: ~{macro_tokens} tok\n")
+
+    print(f"TOTAL headline tokens (prompt estimate): ~{ticker_tokens + macro_tokens} tok")
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--news",
+        action="store_true",
+        help="print ticker + macro headlines with token-count estimates, then exit",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    if args.news:
+        _print_news()
+        return
 
     try:
         _run()
