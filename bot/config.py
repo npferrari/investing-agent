@@ -105,11 +105,25 @@ RISK = {
     # Trade cadence.
     "max_trades_per_day": 6,
     "ticker_cooldown_days": 1,
-    # G9: proposals below this confidence are rejected. Not yet enforced —
-    # risk.py (next step) is where G9 actually gets checked.
+    # G9: proposals below this confidence are rejected by bot/risk.py.
     "confidence_floor": 0.6,
     "daily_cost_cap_usd": 1.50,
 }
+
+# Slippage haircut for full-run market-on-open fills, applied analytically in
+# the journal (reported P&L is net of this, not simulated in the order
+# itself — OPG fills at whatever the actual open print is). PRD §8 open item
+# 3 asks for separate US/EU parameters; the universe is US-only today, so one
+# value suffices until international tickers are added.
+SLIPPAGE_HAIRCUT_PCT = 0.05
+
+# Stop-loss sweep confirmation (research/v1-architecture.md §5, 2026-07-23
+# decision): a breach must hold on a second quote fetched this many seconds
+# later before selling, filtering a single bad print rather than trusting one
+# reading. A confirmed stop still implying a single-day move past this
+# threshold is anomalous enough to flag (STOP_ANOMALY) and page a human.
+STOP_CONFIRM_DELAY_SECONDS = 30
+STOP_ANOMALY_SINGLE_DAY_PCT = 15
 
 # Screener/briefing budgets (T2, T6).
 MAX_CANDIDATES_NEW = 12  # discovery slots; held positions ride along uncapped

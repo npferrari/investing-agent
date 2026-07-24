@@ -154,7 +154,14 @@ def _parse_candidates(response):
 
 
 def _run(model, briefing_text, sections, candidate_count, effort, disable_thinking=False):
-    max_tokens = max(400, candidate_count * OUTPUT_TOKENS_PER_CANDIDATE)
+    # Floor raised 400->900 (2026-07-29): verified live that a real 1-holding
+    # light-run briefing (full stat-line + neighborhood + headlines +
+    # coverage instruction, not a bare-bones prompt) truncated mid-JSON at
+    # 550 tokens on Haiku 4.5, on both the batch call and its individual
+    # fallback retry. The per-candidate JSON envelope overhead is
+    # proportionally larger at low candidate counts, so a flat multiplier
+    # alone underbudgets small (light-run) calls specifically.
+    max_tokens = max(900, candidate_count * OUTPUT_TOKENS_PER_CANDIDATE)
     try:
         response = _call(model, briefing_text, max_tokens, effort=effort, disable_thinking=disable_thinking)
     except anthropic.APIError as exc:
@@ -200,40 +207,81 @@ def run_full_analysis(briefing, candidate_count, effort="medium"):
     return result, shadow
 
 
-def run_light_analysis(briefing, candidate_count):
-    """Haiku, restricted to monitor/trim/de-risk.
+def _merge_usage(total, addition):
+    for key in total:
+        total[key] += addition.get(key, 0)
+
+
+def run_light_analysis(briefing, candidate_symbols):
+    """Haiku, restricted to monitor/trim/de-risk, briefed on held positions
+    only (main.py's job to pass a held-only briefing — no discovery
+    candidates, since light runs never open new positions).
 
     Haiku 4.5 doesn't accept `output_config.effort` (errors on that model
     tier), so it's omitted here entirely rather than passed as None-meaning-
-    default. The prompt already tells the model this is a light run (via
-    the global block's regime/breaker context, not a special system prompt —
-    step 13 owns wiring run-mode framing into the persona); this function's
-    job is the *code-level* backstop: any BUY the model proposes anyway is
-    downgraded to HOLD here, logged, because risk.py (next step) doesn't
-    exist yet to be the real enforcement point.
+    default. This function's code-level backstop remains even though
+    risk.py now exists and independently rejects light-run BUYs — defense
+    in depth costs nothing here.
 
-    A live probe (2026-07-23) found that briefing._coverage instruction's
-    "one entry per candidate, no omissions" wording, which reliably gets
-    full coverage from Sonnet, was NOT reliably followed by Haiku 4.5 — it
-    returned 1 of 12 candidates with stop_reason "end_turn" (a deliberate
-    stop, not truncation). Build review decision (2026-07-24), noted here
-    for step 13's main.py wiring rather than acted on now: light-run
-    briefings will contain held positions only (no discovery candidates —
-    light runs never open new positions, so screener.select_candidates
-    shouldn't even run for them), which both matches the guide's
-    monitor/trim/de-risk restriction and shrinks the coverage instruction
-    to a much smaller, more tractable candidate count for the weaker model.
-    No change to select_candidates or build_briefing themselves yet — this
-    is main.py's run-mode branching to build, not this module's.
+    Per-holding fallback (2026-07-24 build review, implemented 2026-07-29):
+    a live probe found Haiku 4.5 doesn't reliably follow the "one entry per
+    candidate" coverage instruction that Sonnet follows reliably (returned
+    1 of 12 candidates, stop_reason "end_turn" — a deliberate stop, not
+    truncation). Rather than accept silent coverage gaps on live positions,
+    any symbol missing from the batch response gets one individual
+    follow-up call, focused on just that symbol. `candidate_symbols` is the
+    full list of held symbols in the briefing, so coverage can actually be
+    checked (a bare count can't tell you *which* one is missing).
     """
+    candidate_count = len(candidate_symbols)
     result = _run(BRAIN_MODEL_LIGHT, briefing["text"], briefing["sections"], candidate_count, effort=None)
-    if result["candidates"]:
-        for candidate in result["candidates"]:
-            if candidate["proposal"]["action"] == "BUY":
-                logger.warning(
-                    "Light run proposed BUY for %s — code-level restriction downgrades to HOLD "
-                    "(risk.py will own this rejection once built).",
-                    candidate["symbol"],
+
+    covered = {c["symbol"] for c in result["candidates"]} if result["candidates"] else set()
+    missing = [s for s in candidate_symbols if s not in covered]
+    if result["candidates"] is None:
+        result["candidates"] = []
+
+    if missing:
+        fallback_usage_total = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+        for symbol in missing:
+            logger.warning(
+                "Light run coverage gap: %s missing from the batch response — "
+                "making an individual fallback call.",
+                symbol,
+            )
+            focused_text = (
+                f"{briefing['text']}\n\n"
+                f"Focus only on {symbol}. Return exactly one entry in `candidates`, for {symbol} only."
+            )
+            fallback = _run(BRAIN_MODEL_LIGHT, focused_text, briefing["sections"], 1, effort=None)
+            if fallback["candidates"]:
+                result["candidates"].extend(fallback["candidates"])
+            else:
+                logger.error(
+                    "Light run fallback call for %s also failed — no proposal for %s this "
+                    "run (FALLBACK_HOLD: doing nothing is always safe).",
+                    symbol,
+                    symbol,
                 )
-                candidate["proposal"]["action"] = "HOLD"
+            if fallback["usage"]:
+                _merge_usage(fallback_usage_total, fallback["usage"])
+
+        result["fallback_calls_made"] = len(missing)
+        if result["usage"] is not None:
+            _merge_usage(result["usage"], fallback_usage_total)
+
+    for candidate in result["candidates"]:
+        if candidate["proposal"]["action"] == "BUY":
+            logger.warning(
+                "Light run proposed BUY for %s — code-level restriction downgrades to HOLD "
+                "(risk.py also independently rejects this).",
+                candidate["symbol"],
+            )
+            candidate["proposal"]["action"] = "HOLD"
+
     return result

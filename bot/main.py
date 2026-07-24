@@ -3,167 +3,271 @@ import logging
 import sys
 import traceback
 
-from bot import brain
+from alpaca.trading.enums import TimeInForce
+
+from bot import brain, positions_state
 from bot.breakers import TRADING_OK, check_circuit_breakers
 from bot.briefing import build_briefing
-from bot.config import DEFAULT_SLEEVE, HEADLINES_PER_TICKER_CAP, HEADLINES_MACRO_CAP, RISK, UNIVERSE
+from bot.config import HEADLINES_MACRO_CAP, HEADLINES_PER_TICKER_CAP, SLIPPAGE_HAIRCUT_PCT, UNIVERSE
 from bot.data import get_daily_bars
 from bot.execute import execute_order, get_equity, get_positions, stop_loss_sweep
-from bot.journal import count_trades_today, journal_error, journal_run, journal_token_usage, read_entries, symbols_in_cooldown
+from bot.journal import (
+    count_risk_adding_trades,
+    in_construction_window,
+    journal_brain_run,
+    journal_error,
+    journal_token_usage,
+    read_entries,
+)
 from bot.news import get_macro_headlines, get_ticker_headlines
+from bot.risk import validate_proposals
 from bot.screener import select_candidates
 from bot.signals import generate_signal, get_indicators, get_regime
 
-# EMA200 needs ~2-3x its period of history to converge (see signals.py's step-2
-# rationale), and the briefing's 52-week percentile needs ~252 trading days —
-# both want more than the v0 flow's days=250 calendar days (~178 trading days,
-# short of even one EMA200 period). The full/dry-run path uses its own,
-# larger fetch rather than "fixing" the live v0 flow's window in this pass.
-FULL_RUN_BAR_DAYS = 400
-
 logger = logging.getLogger("bot.main")
 
-SLEEVE = "MOMENTUM"
-# Pinned at 6% (NOT RISK["momentum_position_pct"], which is 10%) — per the
-# 2026-07-24 build review, this v0 EMA9/21-crossover signal is semantically
-# MOMENTUM, not QUALITY_VALUE, but it keeps its original TACTICAL-era 6%
-# size until step 13 retires v0 execution in favor of the full
-# screener/briefing/brain flow. Deriving the size from momentum_position_pct
-# here would silently 1.67x every v0 trade the moment that RISK key gets
-# tuned for the real MOMENTUM sleeve, with no corresponding review of
-# whether v0 should trade at that size at all — no silent size jump.
-POSITION_SIZE_PCT = 0.06
+# EMA200 needs ~2-3x its period of history to converge (see signals.py's step-2
+# rationale), and the briefing's 52-week percentile needs ~252 trading days.
+FULL_RUN_BAR_DAYS = 400
+
+# Order of execution within one run: SELLs/TRIMs before BUYs, matching
+# risk.py's own validation order — this is what makes a swap at the holdings
+# cap actually work end to end (the SELL's cash/slot freed before the BUY
+# submits), not just validate correctly on paper.
+_ACTION_ORDER = {"SELL": 0, "TRIM": 0, "BUY": 1, "HOLD": 2}
 
 
-def _pregate(status, symbol, action, usd_amount, sleeve, reason):
-    logger.info("%s %s %s $%.2f (%s): %s", status, action, symbol, usd_amount, sleeve, reason)
+def _sleeve_utilization(positions, equity):
+    state = positions_state.load()
+    invested = {"MOMENTUM": 0.0, "QUALITY_VALUE": 0.0, "DEFENSIVE": 0.0}
+    for p in positions:
+        sleeve = positions_state.get_sleeve(p.symbol, state)
+        invested[sleeve] = invested.get(sleeve, 0.0) + float(p.market_value)
+    if not equity:
+        return {sleeve: 0.0 for sleeve in invested}
+    return {sleeve: value / equity * 100 for sleeve, value in invested.items()}
+
+
+def _positions_for_risk_state(positions, state):
+    return [
+        {
+            "symbol": p.symbol,
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+            "sleeve": positions_state.get_sleeve(p.symbol, state),
+        }
+        for p in positions
+    ]
+
+
+def _risk_state(equity, positions, regime, breaker_status, run_mode, validated_symbols):
+    entries = read_entries()
+    state = positions_state.load()
     return {
-        "status": status,
-        "symbol": symbol,
-        "action": action,
-        "usd_amount": usd_amount,
-        "sleeve": sleeve,
-        "reason": reason,
-        "quote": None,
+        "equity": equity,
+        "positions": _positions_for_risk_state(positions, state),
+        "regime": regime,
+        "breaker_status": breaker_status,
+        "run_mode": run_mode,
+        # G13's real NORMAL/DANGER state machine with dwell timers doesn't
+        # exist yet (bot/regime.py — research/v1-architecture.md §4.5), so
+        # there is no real dwell state to compute. Always True until that
+        # module exists; documented here rather than silently assumed.
+        "dwell_ok": True,
+        "in_construction_window": in_construction_window(entries),
+        "risk_adding_trades_this_week": count_risk_adding_trades(entries),
+        "validated_symbols": validated_symbols,
     }
 
 
-def _run():
-    symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
+def _flatten_proposals(candidates):
+    return [{**c["proposal"], "symbol": c["symbol"]} for c in candidates]
 
-    journal_entries = read_entries()
+
+def _with_slippage_estimate(execution):
+    if execution is None or execution["status"] != "SUBMITTED":
+        return execution
+    haircut = execution["order_value"] * SLIPPAGE_HAIRCUT_PCT / 100
+    return {
+        **execution,
+        "slippage_haircut_pct": SLIPPAGE_HAIRCUT_PCT,
+        "estimated_slippage_cost_usd": haircut,
+    }
+
+
+def _validate_and_execute(candidates, risk_state, run_mode):
+    """risk.py verdicts, then execution for anything APPROVED and actionable.
+
+    Returns candidates enriched with "verdict" and "execution", in
+    SELL/TRIM-before-BUY order (matching risk.py's own internal ordering),
+    so a swap at the holdings cap actually settles in the right sequence.
+    """
+    proposals = _flatten_proposals(candidates)
+    verdicts_by_symbol = {v["symbol"]: v for v in validate_proposals(proposals, risk_state)}
+
+    time_in_force = TimeInForce.OPG if run_mode == "FULL" else TimeInForce.DAY
+
+    ordered = sorted(candidates, key=lambda c: _ACTION_ORDER.get(c["proposal"]["action"], 2))
+    enriched = []
+    for candidate in ordered:
+        symbol = candidate["symbol"]
+        verdict = verdicts_by_symbol[symbol]
+        execution = None
+        if verdict["status"] == "APPROVED" and verdict["action"] != "HOLD":
+            execution = execute_order(symbol, verdict["action"], verdict["usd_amount"], verdict["sleeve"], time_in_force=time_in_force)
+            execution = _with_slippage_estimate(execution)
+        enriched.append(
+            {
+                **candidate,
+                "verdict": {"status": verdict["status"], "guardrail": verdict["guardrail"], "reason": verdict["reason"]},
+                "execution": execution,
+            }
+        )
+    return enriched
+
+
+def _print_verdicts(candidates):
+    print("\nRisk verdicts:")
+    for c in candidates:
+        verdict = c["verdict"]
+        proposal = c["proposal"]
+        if verdict["status"] == "APPROVED":
+            print(f"  {c['symbol']:<6} {proposal['action']:<4} APPROVED")
+        else:
+            print(f"  {c['symbol']:<6} {proposal['action']:<4} REJECTED [{verdict['guardrail']}] {verdict['reason']}")
+
+
+def _run_light():
+    entries = read_entries()
     equity = get_equity()
-    breaker_status = check_circuit_breakers(journal_entries, equity)
+    breaker_status = check_circuit_breakers(entries, equity)
     if breaker_status != TRADING_OK:
         logger.warning("Circuit breaker active: %s — BUYs will be rejected this run.", breaker_status)
 
-    # Stop-losses run unconditionally, breaker or not: they only reduce risk.
-    results = stop_loss_sweep()
+    # Stop-losses run unconditionally, breaker or not — they only reduce risk.
+    sweep_results = stop_loss_sweep()
 
-    held_symbols = {p.symbol for p in get_positions()}
-    trades_today_count = count_trades_today(journal_entries, action="BUY")
-    cooldown_symbols = symbols_in_cooldown(journal_entries, RISK["ticker_cooldown_days"], action="BUY")
+    positions = get_positions()
+    held_symbols = sorted({p.symbol for p in positions})
 
-    # Sized off live account equity, not a hardcoded dollar figure, so this
-    # tracks deposits/withdrawals/resets on the paper account automatically.
-    buy_usd_amount = equity * POSITION_SIZE_PCT
-
-    bars = get_daily_bars(symbols, days=250)
-
-    indicators = get_indicators(bars)
+    # Bars are fetched for the whole universe, not just held symbols + SPY/QQQ
+    # — briefing._neighborhood() needs each held symbol's sector ETF and peer
+    # stocks too (a held position can be in any sector), and bars are free,
+    # code-side data (T1) that never reaches the LLM, so there's no token
+    # cost to fetching more than strictly needed. Only the *candidates* list
+    # (held-only) is what actually keeps a light run cheap and small.
+    all_symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
+    bars = get_daily_bars(all_symbols, days=FULL_RUN_BAR_DAYS)
+    universe_data = get_indicators(bars)
     regime = get_regime(bars.loc["SPY"], bars.loc["QQQ"])
 
-    print(f"Regime: {regime}  Breaker: {breaker_status}\n")
-    header = (
-        f"{'Symbol':<8}{'Close':>10}{'EMA9':>10}{'EMA21':>10}{'EMA50':>10}"
-        f"{'EMA200':>10}{'%vsEMA200':>11}{'RSI14':>8}{'Cross':>8}{'Signal':>8}"
+    if not held_symbols:
+        logger.info("LIGHT run: no held positions — nothing to monitor.")
+        journal_brain_run("LIGHT", regime, breaker_status, [], sweep_results, positions, equity, {})
+        return
+
+    # Held positions only — no discovery candidates. Light runs never open
+    # new positions, so briefing the discovery universe would be pure waste
+    # (§5 token economy) and, per the 2026-07-24 build review, actively hurts
+    # coverage on the smaller model by diluting its attention across
+    # candidates it can never act on anyway.
+    ticker_headlines = get_ticker_headlines(held_symbols, cap=HEADLINES_PER_TICKER_CAP)
+    macro_headlines = get_macro_headlines(cap=HEADLINES_MACRO_CAP)
+    sleeve_utilization = _sleeve_utilization(positions, equity)
+
+    briefing = build_briefing(
+        held_symbols,
+        universe_data,
+        bars,
+        positions,
+        ticker_headlines,
+        macro_headlines,
+        regime,
+        breaker_status,
+        sleeve_utilization,
+        equity,
     )
-    print(header)
-    print("-" * len(header))
 
-    analyzed = {}
-    for symbol in symbols:
-        ind = indicators[symbol]
-        signal = generate_signal(ind, regime)
-        analyzed[symbol] = {**ind, "signal": signal}
-        print(
-            f"{symbol:<8}{ind['close']:>10.2f}{ind['ema9']:>10.2f}{ind['ema21']:>10.2f}"
-            f"{ind['ema50']:>10.2f}{ind['ema200']:>10.2f}{ind['pct_from_ema200']:>10.1f}%"
-            f"{ind['rsi14']:>8.1f}{ind['cross']:>8}{signal:>8}"
-        )
+    result = brain.run_light_analysis(briefing, held_symbols)
+    if result["usage"] is not None:
+        journal_token_usage("LIGHT", result["model"], result["section_estimates"], result["usage"])
 
-        if signal == "BUY":
-            if symbol in held_symbols:
-                results.append(
-                    _pregate(
-                        "SKIPPED_ALREADY_HELD",
-                        symbol,
-                        "BUY",
-                        buy_usd_amount,
-                        SLEEVE,
-                        "already holding a position in this ticker",
-                    )
-                )
-            elif breaker_status != TRADING_OK:
-                results.append(
-                    _pregate(
-                        "REJECTED",
-                        symbol,
-                        "BUY",
-                        buy_usd_amount,
-                        SLEEVE,
-                        f"BREAKER_DEFENSIVE ({breaker_status})",
-                    )
-                )
-            elif symbol in cooldown_symbols:
-                results.append(
-                    _pregate(
-                        "SKIPPED_COOLDOWN",
-                        symbol,
-                        "BUY",
-                        buy_usd_amount,
-                        SLEEVE,
-                        f"bought within the last {RISK['ticker_cooldown_days']}d cooldown window",
-                    )
-                )
-            elif trades_today_count >= RISK["max_trades_per_day"]:
-                results.append(
-                    _pregate(
-                        "SKIPPED_TRADE_LIMIT",
-                        symbol,
-                        "BUY",
-                        buy_usd_amount,
-                        SLEEVE,
-                        f"daily trade limit reached ({RISK['max_trades_per_day']})",
-                    )
-                )
-            else:
-                result = execute_order(symbol, "BUY", buy_usd_amount, SLEEVE)
-                results.append(result)
-                if result["status"] == "SUBMITTED":
-                    trades_today_count += 1
-        elif signal == "SELL" and symbol in held_symbols:
-            position = next(p for p in get_positions() if p.symbol == symbol)
-            results.append(execute_order(symbol, "SELL", float(position.market_value), SLEEVE))
-
-    print("\nExecution summary:")
-    if not results:
-        print("  no actions taken")
-    for r in results:
-        if r["status"] == "SUBMITTED":
-            size = f"notional=${r['notional']:.2f}" if r["notional"] is not None else f"qty={r['qty']}"
-            print(
-                f"  {r['symbol']:<6} {r['action']:<4} SUBMITTED {size} "
-                f"bid={r['quote']['bid']:.2f} ask={r['quote']['ask']:.2f} order_id={r['order_id']}"
-            )
-        elif r["status"].startswith("SKIPPED_"):
-            print(f"  {r['symbol']:<6} {r['action']:<4} {r['status']} — {r['reason']}")
-        else:
-            print(f"  {r['symbol']:<6} {r['action']:<4} REJECTED — {r['reason']}")
+    candidates = result["candidates"] or []
+    risk_state = _risk_state(equity, positions, regime, breaker_status, "LIGHT", set(universe_data.keys()))
+    enriched = _validate_and_execute(candidates, risk_state, "LIGHT")
 
     final_positions = get_positions()
     final_equity = get_equity()
-    journal_run(regime, analyzed, results, final_positions, final_equity, breaker_status)
+    journal_brain_run(
+        "LIGHT", regime, breaker_status, enriched, sweep_results, final_positions, final_equity, result.get("usage") or {}
+    )
+
+
+def _run_full():
+    entries = read_entries()
+    equity = get_equity()
+    breaker_status = check_circuit_breakers(entries, equity)
+    if breaker_status != TRADING_OK:
+        logger.warning("Circuit breaker active: %s — BUYs will be rejected this run.", breaker_status)
+
+    sweep_results = stop_loss_sweep()
+
+    symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
+    bars = get_daily_bars(symbols, days=FULL_RUN_BAR_DAYS)
+    universe_data = get_indicators(bars)
+    regime = get_regime(bars.loc["SPY"], bars.loc["QQQ"])
+
+    # v0's signal is computed and journaled as a benchmark only — it never
+    # executes. The screener/briefing/brain/risk pipeline below is the sole
+    # path that trades for real (step 13 retires v0 execution).
+    v0_signals = {symbol: generate_signal(universe_data[symbol], regime) for symbol in symbols}
+
+    positions = get_positions()
+    ticker_headlines = get_ticker_headlines(symbols, cap=HEADLINES_PER_TICKER_CAP)
+    macro_headlines = get_macro_headlines(cap=HEADLINES_MACRO_CAP)
+
+    candidates_list, scores = select_candidates(universe_data, positions, ticker_headlines)
+    sleeve_utilization = _sleeve_utilization(positions, equity)
+
+    briefing = build_briefing(
+        candidates_list,
+        universe_data,
+        bars,
+        positions,
+        ticker_headlines,
+        macro_headlines,
+        regime,
+        breaker_status,
+        sleeve_utilization,
+        equity,
+    )
+
+    full_result, shadow_result = brain.run_full_analysis(briefing, len(candidates_list))
+    if full_result["usage"] is not None:
+        journal_token_usage("FULL", full_result["model"], full_result["section_estimates"], full_result["usage"])
+    if shadow_result is not None and shadow_result["usage"] is not None:
+        journal_token_usage("SHADOW", shadow_result["model"], shadow_result["section_estimates"], shadow_result["usage"])
+
+    candidates = full_result["candidates"] or []
+    risk_state = _risk_state(equity, positions, regime, breaker_status, "FULL", set(universe_data.keys()))
+    # SELLs before BUYs, submitted market-on-open (OPG) for the next session
+    # — never at decision-time prices.
+    enriched = _validate_and_execute(candidates, risk_state, "FULL")
+
+    final_positions = get_positions()
+    final_equity = get_equity()
+    journal_brain_run(
+        "FULL",
+        regime,
+        breaker_status,
+        enriched,
+        sweep_results,
+        final_positions,
+        final_equity,
+        full_result.get("usage") or {},
+        briefing_sections=briefing["sections"],
+        v0_signals=v0_signals,
+    )
 
 
 # Rough chars-per-token heuristic (~4:1 for English prose), good enough to
@@ -203,17 +307,6 @@ def _print_news():
     print(f"  subtotal: ~{macro_tokens} tok\n")
 
     print(f"TOTAL headline tokens (prompt estimate): ~{ticker_tokens + macro_tokens} tok")
-
-
-def _sleeve_utilization(positions, equity):
-    # Every position is reported under DEFAULT_SLEEVE until positions_state.json
-    # sleeve tagging lands (step 13) — same known gap as briefing._position_line.
-    invested = {"MOMENTUM": 0.0, "QUALITY_VALUE": 0.0, "DEFENSIVE": 0.0}
-    for p in positions:
-        invested[DEFAULT_SLEEVE] += float(p.market_value)
-    if not equity:
-        return {sleeve: 0.0 for sleeve in invested}
-    return {sleeve: value / equity * 100 for sleeve, value in invested.items()}
 
 
 def _print_forecast(label, forecast):
@@ -293,6 +386,16 @@ def _dry_run():
                 "SHADOW", shadow_result["model"], shadow_result["section_estimates"], shadow_result["usage"]
             )
 
+    # risk.py verdicts are pure/no side effects, so showing them here doesn't
+    # compromise --dry-run's no-execution contract — it just makes the
+    # preview actually useful now that risk.py exists.
+    if full_result["candidates"]:
+        risk_state = _risk_state(equity, positions, regime, breaker_status, "FULL", set(universe_data.keys()))
+        proposals = _flatten_proposals(full_result["candidates"])
+        verdicts_by_symbol = {v["symbol"]: v for v in validate_proposals(proposals, risk_state)}
+        preview = [{**c, "verdict": verdicts_by_symbol[c["symbol"]]} for c in full_result["candidates"]]
+        _print_verdicts(preview)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -304,7 +407,12 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="run screener -> briefing -> brain (full) and print results without executing, then exit",
+        help="run screener -> briefing -> brain (full) and print results + risk verdicts without executing, then exit",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["light", "full"],
+        help="LIGHT (pre-open/midday: monitor/trim/de-risk only) or FULL (after-close: may open positions)",
     )
     args = parser.parse_args()
 
@@ -318,8 +426,14 @@ def main():
         _dry_run()
         return
 
+    if args.mode is None:
+        parser.error("--mode {light,full} is required for a live run")
+
     try:
-        _run()
+        if args.mode == "light":
+            _run_light()
+        else:
+            _run_full()
     except Exception as exc:
         journal_error(exc)
         traceback.print_exc()
