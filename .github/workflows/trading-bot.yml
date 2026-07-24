@@ -98,7 +98,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add -f logs/journal.jsonl logs/run_history.log logs/positions_state.json 2>/dev/null || true
+          # One `git add -f` call per path, not one call for all three: a
+          # single multi-pathspec `git add -f` fails atomically (and stages
+          # NOTHING, not even the paths that did exist) the moment any one
+          # pathspec doesn't match a file — verified live 2026-07-24.
+          # logs/positions_state.json doesn't exist until the first real
+          # order is ever submitted, so every run before that point was
+          # silently failing to commit journal.jsonl/run_history.log too,
+          # masked by this step's own `2>/dev/null || true`.
+          git add -f logs/journal.jsonl 2>/dev/null || true
+          git add -f logs/run_history.log 2>/dev/null || true
+          git add -f logs/positions_state.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No log changes to commit."
             exit 0

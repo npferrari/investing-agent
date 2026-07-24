@@ -153,15 +153,21 @@ def _parse_candidates(response):
         return None
 
 
-def _run(model, briefing_text, sections, candidate_count, effort, disable_thinking=False):
-    # Floor raised 400->900 (2026-07-29): verified live that a real 1-holding
-    # light-run briefing (full stat-line + neighborhood + headlines +
-    # coverage instruction, not a bare-bones prompt) truncated mid-JSON at
-    # 550 tokens on Haiku 4.5, on both the batch call and its individual
-    # fallback retry. The per-candidate JSON envelope overhead is
-    # proportionally larger at low candidate counts, so a flat multiplier
-    # alone underbudgets small (light-run) calls specifically.
-    max_tokens = max(900, candidate_count * OUTPUT_TOKENS_PER_CANDIDATE)
+def _run(model, briefing_text, sections, candidate_count, effort, disable_thinking=False, max_tokens=None):
+    if max_tokens is None:
+        # Batch-call budget: shared across candidate_count candidates in one
+        # response. Floor raised 400->900 (2026-07-29 build review) after a
+        # real 1-holding light-run briefing truncated mid-JSON at 550 tokens
+        # on Haiku 4.5 — the per-candidate JSON envelope overhead is
+        # proportionally larger at low candidate counts than the 12-candidate
+        # full-run case OUTPUT_TOKENS_PER_CANDIDATE was calibrated against.
+        # Superseded for light runs specifically by LIGHT_RUN_TOKENS_PER_CALL
+        # below (2026-07-24 production run: even that 900-token *shared*
+        # budget, effectively a per-candidate budget for a 1-holding run,
+        # still truncated — proving a shared/derived budget isn't reliably
+        # enough even at n=1, let alone n>1 where one verbose candidate can
+        # crowd out every other candidate's tokens in the same response).
+        max_tokens = max(900, candidate_count * OUTPUT_TOKENS_PER_CANDIDATE)
     try:
         response = _call(model, briefing_text, max_tokens, effort=effort, disable_thinking=disable_thinking)
     except anthropic.APIError as exc:
@@ -212,6 +218,18 @@ def _merge_usage(total, addition):
         total[key] += addition.get(key, 0)
 
 
+# Dedicated, generous, fixed budget for light-run calls — not derived from
+# OUTPUT_TOKENS_PER_CANDIDATE's batch formula. Every light-run call is
+# single-candidate by construction (see run_light_analysis), so this budget
+# never has to be shared or divided; it just needs headroom against one
+# candidate's natural response-length variance. Verified live 2026-07-24:
+# a production run truncated a single held position (AAPL) at 900 tokens
+# despite that already being an effectively per-candidate budget at n=1 —
+# 1800 gives a 2x margin over the observed failure, at a cost that's
+# immaterial on Haiku pricing ($5/MTok output) even at PRD's 15-holding max.
+LIGHT_RUN_TOKENS_PER_CALL = 1800
+
+
 def run_light_analysis(briefing, candidate_symbols):
     """Haiku, restricted to monitor/trim/de-risk, briefed on held positions
     only (main.py's job to pass a held-only briefing — no discovery
@@ -223,59 +241,61 @@ def run_light_analysis(briefing, candidate_symbols):
     risk.py now exists and independently rejects light-run BUYs — defense
     in depth costs nothing here.
 
-    Per-holding fallback (2026-07-24 build review, implemented 2026-07-29):
-    a live probe found Haiku 4.5 doesn't reliably follow the "one entry per
-    candidate" coverage instruction that Sonnet follows reliably (returned
-    1 of 12 candidates, stop_reason "end_turn" — a deliberate stop, not
-    truncation). Rather than accept silent coverage gaps on live positions,
-    any symbol missing from the batch response gets one individual
-    follow-up call, focused on just that symbol. `candidate_symbols` is the
-    full list of held symbols in the briefing, so coverage can actually be
-    checked (a bare count can't tell you *which* one is missing).
+    One individual API call per held symbol, ALWAYS — not a batch call with
+    a per-holding fallback for stragglers (the original design, replaced
+    2026-07-24 after two live findings). First: Haiku 4.5 doesn't reliably
+    follow the "one entry per candidate" coverage instruction that Sonnet
+    follows reliably (returned 1 of 12 candidates, stop_reason "end_turn" —
+    a deliberate stop, not truncation). Second, and more fundamental: a
+    shared batch token budget means one candidate's natural verbosity can
+    truncate every candidate in the same response — verified in production,
+    a single held position alone hit this. Per-holding-always with its own
+    dedicated LIGHT_RUN_TOKENS_PER_CALL budget makes that failure mode
+    structurally impossible: no candidate's output ever competes with
+    another's for tokens, and a failure on one symbol can't cascade to wipe
+    out the others. With light runs bounded by PRD's 10-15 holdings, the
+    extra API calls this costs are immaterial on Haiku's pricing — the
+    input tokens re-send the same held-only briefing per call rather than
+    caching it across calls, and even that isn't worth optimizing at this
+    scale.
     """
-    candidate_count = len(candidate_symbols)
-    result = _run(BRAIN_MODEL_LIGHT, briefing["text"], briefing["sections"], candidate_count, effort=None)
+    usage_total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    section_estimates_total = {}
+    candidates = []
 
-    covered = {c["symbol"] for c in result["candidates"]} if result["candidates"] else set()
-    missing = [s for s in candidate_symbols if s not in covered]
-    if result["candidates"] is None:
-        result["candidates"] = []
-
-    if missing:
-        fallback_usage_total = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        }
-        for symbol in missing:
-            logger.warning(
-                "Light run coverage gap: %s missing from the batch response — "
-                "making an individual fallback call.",
+    for symbol in candidate_symbols:
+        focused_text = (
+            f"{briefing['text']}\n\n"
+            f"Focus only on {symbol}. Return exactly one entry in `candidates`, for {symbol} only."
+        )
+        result = _run(
+            BRAIN_MODEL_LIGHT,
+            focused_text,
+            briefing["sections"],
+            1,
+            effort=None,
+            max_tokens=LIGHT_RUN_TOKENS_PER_CALL,
+        )
+        if result["usage"] is not None:
+            _merge_usage(usage_total, result["usage"])
+            for name, tokens in result["section_estimates"].items():
+                section_estimates_total[name] = section_estimates_total.get(name, 0) + tokens
+        if result["candidates"]:
+            candidates.extend(result["candidates"])
+        else:
+            logger.error(
+                "Light run call for %s failed — no proposal for %s this run "
+                "(FALLBACK_HOLD: doing nothing is always safe).",
+                symbol,
                 symbol,
             )
-            focused_text = (
-                f"{briefing['text']}\n\n"
-                f"Focus only on {symbol}. Return exactly one entry in `candidates`, for {symbol} only."
-            )
-            fallback = _run(BRAIN_MODEL_LIGHT, focused_text, briefing["sections"], 1, effort=None)
-            if fallback["candidates"]:
-                result["candidates"].extend(fallback["candidates"])
-            else:
-                logger.error(
-                    "Light run fallback call for %s also failed — no proposal for %s this "
-                    "run (FALLBACK_HOLD: doing nothing is always safe).",
-                    symbol,
-                    symbol,
-                )
-            if fallback["usage"]:
-                _merge_usage(fallback_usage_total, fallback["usage"])
 
-        result["fallback_calls_made"] = len(missing)
-        if result["usage"] is not None:
-            _merge_usage(result["usage"], fallback_usage_total)
-
-    for candidate in result["candidates"]:
+    for candidate in candidates:
         if candidate["proposal"]["action"] == "BUY":
             logger.warning(
                 "Light run proposed BUY for %s — code-level restriction downgrades to HOLD "
@@ -283,5 +303,15 @@ def run_light_analysis(briefing, candidate_symbols):
                 candidate["symbol"],
             )
             candidate["proposal"]["action"] = "HOLD"
+            # Zero the stale BUY amount too, not just the action — otherwise
+            # this reads as "APPROVED HOLD AAPL $400.00" in logs/journal,
+            # which looks like a HOLD somehow still moved money.
+            candidate["proposal"]["usd_amount"] = 0
 
-    return result
+    return {
+        "model": BRAIN_MODEL_LIGHT,
+        "candidates": candidates,
+        "fallback": not candidates,
+        "usage": usage_total,
+        "section_estimates": section_estimates_total,
+    }
