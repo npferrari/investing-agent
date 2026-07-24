@@ -3,24 +3,38 @@ name: Trading bot
 on:
   schedule:
     # Times below are UTC, off-the-hour to dodge GitHub's queue congestion at
-    # :00/:15/:30/:45, and tuned for US market hours in EDT (UTC-4, roughly
-    # mid-March to early November). During EST (UTC-5, winter), each run lands
-    # one hour earlier in New York time:
-    #   13:40 UTC -> 09:40 EDT (10 min after open) | 08:40 EST (pre-open)
-    #   16:53 UTC -> 12:53 EDT (midday)             | 11:53 EST (still mid-session)
-    #   19:12 UTC -> 15:12 EDT (48 min before close) | 14:12 EST (still mid-session)
-    # The pre-close slot is deliberately kept >=45 min ahead of the 20:00 UTC
-    # (EDT) close so a delayed/queued run still lands before the bell.
-    # GitHub Actions cron does not follow DST, so the 13:40 slot fires before
-    # the open for roughly half the year. This is a wasted run, not an unsafe
-    # one: bot/execute.py refuses every order when TradingClient.get_clock()
-    # reports the market closed, so a mistimed trigger just no-ops. Adjust
-    # these three values by an hour around the March/November DST changes if
-    # tighter alignment to the open/midday/pre-close windows is needed.
-    - cron: "40 13 * * 1-5"
+    # :00/:15/:30/:45, and tuned for EDT (UTC-4, roughly mid-March to early
+    # November):
+    #   12:23 UTC -> 08:23 EDT (pre-open, LIGHT)  | 07:23 EST (pre-open)
+    #   16:53 UTC -> 12:53 EDT (midday, LIGHT)    | 11:53 EST (still mid-session)
+    #   23:23 UTC -> 19:23 EDT (FULL)             | 18:23 EST (see DST note below)
+    #
+    # The FULL slot's time is not a market-hours choice — it's Alpaca's
+    # market-on-open (OPG) order acceptance window, verified live 2026-07-29:
+    # OPG orders are only accepted "after 7:00pm and before 9:28am" ET. 19:23
+    # EDT clears that by 23 minutes; the two LIGHT slots don't submit OPG
+    # orders at all (stop-loss sweep fills are immediate DAY orders), so they
+    # only need to land during/near market hours, which they do.
+    #
+    # GitHub Actions cron does not follow DST. During EST (winter), the FULL
+    # slot fires at 18:23 ET — 37 minutes *before* the 7pm ET OPG window
+    # opens, so brain-approved trades would bounce with a graceful REJECTED
+    # (bot/execute.py catches this, per the live-verified fix — it no longer
+    # crashes the run), not silently misbehave. Move this to "23 0 * * 1-5"
+    # (00:23 UTC, i.e. 7:23pm EST) for the November-March window if that
+    # bounce is worth avoiding; adjust back at the March DST change.
+    - cron: "23 12 * * 1-5"
     - cron: "53 16 * * 1-5"
-    - cron: "12 19 * * 1-5"
-  workflow_dispatch: {}
+    - cron: "23 23 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        type: choice
+        options:
+          - light
+          - full
 
 # Queue overlapping runs instead of cancelling or running concurrently: two
 # runs racing each other could both pass the "already held" check in
@@ -58,12 +72,25 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ -n "${{ github.event.inputs.mode }}" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "23 23 * * 1-5" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=light" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run bot
         if: steps.killswitch.outputs.enabled == 'true'
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python -m bot.main
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m bot.main --mode ${{ steps.mode.outputs.mode }}
 
       - name: Commit logs
         if: always() && steps.killswitch.outputs.enabled == 'true'
@@ -71,7 +98,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add -f logs/journal.jsonl logs/run_history.log 2>/dev/null || true
+          git add -f logs/journal.jsonl logs/run_history.log logs/positions_state.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No log changes to commit."
             exit 0
@@ -82,9 +109,15 @@ jobs:
           # after our own changes are committed — never before. .gitattributes
           # declares merge=union for logs/*.jsonl and logs/*.log, so a
           # concurrent run's appended lines merge cleanly on rebase instead
-          # of conflicting. A rejected push means another run landed between
-          # our pull and our push; retry with a fresh pull --rebase up to 3
-          # attempts total.
+          # of conflicting. logs/positions_state.json has no merge=union
+          # entry (a JSON object, not an append-only log — a line-union
+          # merge would produce invalid JSON); the "concurrency" group above
+          # already queues runs sequentially rather than racing them, so a
+          # genuine conflict here should be rare, and if one happens the
+          # rebase fails loudly (triggering the failure-issue step below)
+          # rather than silently corrupting sleeve state. A rejected push
+          # means another run landed between our pull and our push; retry
+          # with a fresh pull --rebase up to 3 attempts total.
           git pull --rebase origin main
           attempt=1
           max_attempts=3
