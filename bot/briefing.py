@@ -199,6 +199,7 @@ def build_briefing(
     regime,
     breaker_status,
     sleeve_utilization,
+    equity,
 ):
     """Assemble the full user-message text for brain.py's single API call.
 
@@ -211,8 +212,18 @@ def build_briefing(
     forecast_accuracy = load_forecast_accuracy()
     journal_entries = read_entries()
 
+    # 2026-07-28 build review fix: the global block previously reported
+    # sleeve utilization as percentages only, never the NAV those
+    # percentages are relative to — the brain had no way to compute what
+    # "8% of NAV" or "20% of NAV" (its own system prompt's stated caps)
+    # actually meant in dollars, and its proposed usd_amounts were
+    # ungrounded guesses as a result (verified: proposals 7-11x over the
+    # real per-stock cap on a $5,000 account). NAV is now stated explicitly.
     utilization_str = " ".join(f"{sleeve} {pct:.0f}%" for sleeve, pct in sleeve_utilization.items())
-    global_block = f"Regime: {regime} | Breaker: {breaker_status} | Sleeve utilization: {utilization_str}"
+    global_block = (
+        f"Regime: {regime} | Breaker: {breaker_status} | NAV: ${equity:,.2f} | "
+        f"Sleeve utilization: {utilization_str}"
+    )
 
     macro_lines = [f"  macro: {h['title']} ({h['age_hours']}h, {h['source']})" for h in macro_headlines]
     macro_text = "\n".join(macro_lines) if macro_lines else "  macro: (none in window)"

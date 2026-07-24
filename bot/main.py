@@ -275,6 +275,7 @@ def _dry_run():
         regime,
         breaker_status,
         sleeve_utilization,
+        equity,
     )
 
     print(f"Regime: {regime}  Breaker: {breaker_status}  Candidates: {len(candidates)}\n")
