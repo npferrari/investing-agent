@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bot.config import (
-    DEFAULT_SLEEVE,
     NEWS_SPIKE_SUMMARY_CAP,
     SECTOR_ETF_MAP,
     SECTOR_MAP,
@@ -116,17 +115,24 @@ def _neighborhood(symbol, bars):
 
 
 def _position_line(symbol, positions_by_symbol, journal_entries):
+    """`positions_by_symbol` values are the resolved dicts from
+    execute.get_positions_with_sleeves() — sleeve/opened_at came from
+    positions_state.reconcile(), the single source of truth (2026-07-24
+    fix: this function used to hardcode DEFAULT_SLEEVE unconditionally,
+    a leftover from before positions_state.py existed, silently diverging
+    from every other module that read the real tracked sleeve)."""
     position = positions_by_symbol.get(symbol)
     if position is None:
         return None
-    unrealized_pct = float(position.unrealized_plpc) * 100
-    opened_at = position_opened_date(journal_entries, symbol)
+    unrealized_pct = position["unrealized_plpc"]
+    # positions_state's own opened_at (recorded at BUY time) is primary;
+    # the journal-scan inference is only a fallback for a position
+    # reconcile() reports as untracked (opened_at is None there).
+    opened_at = position.get("opened_at") or position_opened_date(journal_entries, symbol)
     days_held = "n/a"
     if opened_at:
         days_held = str((datetime.now(timezone.utc) - datetime.fromisoformat(opened_at)).days)
-    # No positions_state.json yet (lands with sleeve tagging in a later
-    # step) — every held position is reported under DEFAULT_SLEEVE until then.
-    return f"pos: {DEFAULT_SLEEVE} {unrealized_pct:+.1f}% {days_held}d"
+    return f"pos: {position['sleeve']} {unrealized_pct:+.1f}% {days_held}d"
 
 
 def _stat_line(symbol, universe_data, bars, positions_by_symbol, journal_entries):
@@ -208,7 +214,7 @@ def build_briefing(
     so brain.py can log per-section token estimates without recomputing
     them (T1/T3/T4/T5).
     """
-    positions_by_symbol = {p.symbol: p for p in positions}
+    positions_by_symbol = {p["symbol"]: p for p in positions}
     forecast_accuracy = load_forecast_accuracy()
     journal_entries = read_entries()
 

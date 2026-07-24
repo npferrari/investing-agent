@@ -3,7 +3,6 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from bot import positions_state
 from bot.config import ENV, RISK
 
 LOG_DIR = Path("logs")
@@ -75,14 +74,19 @@ def symbols_in_cooldown(entries, cooldown_days, action="BUY"):
 
 
 def position_opened_date(entries, symbol):
-    """First timestamp of the current unbroken streak of holding `symbol`.
+    """First timestamp of the current unbroken streak of holding `symbol`,
+    inferred from the journal's own historical position snapshots.
 
-    There is no dedicated positions_state.json yet (that lands with sleeve
-    tagging in a later step), so "days held" for the briefing is derived
-    from the journal's own historical position snapshots: walk runs
-    newest-first, keep going back while the symbol is still held, and return
-    the timestamp of the oldest run in that unbroken streak. Returns None if
-    the symbol isn't currently held or has no journal history.
+    This is the SECONDARY source for "days held" — positions_state.json's
+    own `opened_at` (recorded precisely at BUY time) is authoritative when
+    present; briefing._position_line() only falls back to this journal-scan
+    inference for a position positions_state.reconcile() reports as
+    untracked (a manual trade, a pre-tracking position, or a stale dust
+    remainder). Walks runs newest-first, keeps going back while the symbol
+    is still held, and returns the timestamp of the oldest run in that
+    unbroken streak. Returns None if the symbol isn't currently held, has
+    no journal history, or the journal has a gap in that streak (e.g. the
+    2026-07-24 git-add bug that silently dropped several runs' commits).
     """
     dated = sorted(
         (e for e in entries if "timestamp" in e and "positions" in e),
@@ -99,15 +103,17 @@ def position_opened_date(entries, symbol):
 
 
 def _positions_payload(positions):
-    state = positions_state.load()
+    """`positions` are already-resolved dicts from
+    execute.get_positions_with_sleeves() — sleeve/opened_at came from
+    positions_state.reconcile() upstream, once, not re-derived here."""
     return [
         {
-            "symbol": p.symbol,
-            "qty": float(p.qty),
-            "market_value": float(p.market_value),
-            "avg_entry_price": float(p.avg_entry_price),
-            "unrealized_pl": float(p.unrealized_pl),
-            "sleeve": positions_state.get_sleeve(p.symbol, state),
+            "symbol": p["symbol"],
+            "qty": p["qty"],
+            "market_value": p["market_value"],
+            "avg_entry_price": p["avg_entry_price"],
+            "unrealized_pl": p["unrealized_pl"],
+            "sleeve": p["sleeve"],
         }
         for p in positions
     ]

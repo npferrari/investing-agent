@@ -285,12 +285,20 @@ def run_light_analysis(briefing, candidate_symbols):
             _merge_usage(usage_total, result["usage"])
             for name, tokens in result["section_estimates"].items():
                 section_estimates_total[name] = section_estimates_total.get(name, 0) + tokens
-        if result["candidates"]:
-            candidates.extend(result["candidates"])
+
+        # Keep only the entry matching the symbol this call actually asked
+        # about — verified live 2026-07-24: despite "return exactly one
+        # entry ... for {symbol} only", a single-symbol focused call can
+        # still come back with a second, degenerate entry (empty symbol,
+        # zero confidence, empty rationale/thesis). Blindly extending with
+        # the whole array puts garbage rows in the forecast ledger.
+        matches = [c for c in (result["candidates"] or []) if c["symbol"] == symbol]
+        if matches:
+            candidates.append(matches[0])
         else:
             logger.error(
-                "Light run call for %s failed — no proposal for %s this run "
-                "(FALLBACK_HOLD: doing nothing is always safe).",
+                "Light run call for %s failed or returned no matching entry — no proposal "
+                "for %s this run (FALLBACK_HOLD: doing nothing is always safe).",
                 symbol,
                 symbol,
             )

@@ -35,7 +35,7 @@ def select_candidates(universe_data, positions, news):
     held positions alone reach or exceed the cap, discovery slots are simply
     zero for this run (logged) rather than silently dropping a holding.
     """
-    held_symbols = {p.symbol for p in positions}
+    held_symbols = {p["symbol"] for p in positions}
 
     scores = {
         symbol: _attention_score(indicators, len(news.get(symbol, [])))

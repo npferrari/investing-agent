@@ -35,6 +35,30 @@ def get_positions():
     return _trading_client.get_all_positions()
 
 
+def get_positions_with_sleeves():
+    """The single source of truth for "what do we hold, under which sleeve,
+    since when" — every other module (main.py, journal.py, briefing.py)
+    consumes this instead of independently combining get_positions() with
+    its own positions_state lookup. See positions_state.reconcile() for
+    what "reconcile" resolves.
+    """
+    positions = get_positions()
+    tracked = positions_state.reconcile(p.symbol for p in positions)
+    return [
+        {
+            "symbol": p.symbol,
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+            "avg_entry_price": float(p.avg_entry_price),
+            "unrealized_pl": float(p.unrealized_pl),
+            "unrealized_plpc": float(p.unrealized_plpc) * 100,
+            "sleeve": tracked[p.symbol]["sleeve"],
+            "opened_at": tracked[p.symbol]["opened_at"],
+        }
+        for p in positions
+    ]
+
+
 def get_equity():
     return float(_trading_client.get_account().equity)
 
@@ -229,16 +253,15 @@ def stop_loss_sweep():
     scorecard.py's hit-rate stats once that exists (accepted, bounded risk,
     not silently absorbed into the track record).
     """
-    state = positions_state.load()
     results = []
 
-    for position in _trading_client.get_all_positions():
-        symbol = position.symbol
-        sleeve = positions_state.get_sleeve(symbol, state)
+    for position in get_positions_with_sleeves():
+        symbol = position["symbol"]
+        sleeve = position["sleeve"]
         stop_pct = RISK[f"stop_{sleeve.lower()}_pct"]
-        avg_entry = float(position.avg_entry_price)
+        avg_entry = position["avg_entry_price"]
 
-        unrealized_pct = float(position.unrealized_plpc) * 100
+        unrealized_pct = position["unrealized_plpc"]
         if unrealized_pct > stop_pct:
             continue
 
@@ -291,7 +314,7 @@ def stop_loss_sweep():
 
         # Sell the full position: usd_amount is its current market value, so
         # the notional/qty logic above closes it out rather than trimming it.
-        result = execute_order(symbol, "SELL", float(position.market_value), sleeve)
+        result = execute_order(symbol, "SELL", position["market_value"], sleeve)
         result["stop_status"] = status
         result["confirmed_unrealized_pct"] = confirmed_pct
         result["single_day_move_pct"] = single_day_pct

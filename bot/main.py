@@ -5,12 +5,12 @@ import traceback
 
 from alpaca.trading.enums import TimeInForce
 
-from bot import brain, positions_state
+from bot import brain
 from bot.breakers import TRADING_OK, check_circuit_breakers
 from bot.briefing import build_briefing
 from bot.config import HEADLINES_MACRO_CAP, HEADLINES_PER_TICKER_CAP, SLIPPAGE_HAIRCUT_PCT, UNIVERSE
 from bot.data import get_daily_bars
-from bot.execute import execute_order, get_equity, get_positions, stop_loss_sweep
+from bot.execute import execute_order, get_equity, get_positions_with_sleeves, stop_loss_sweep
 from bot.journal import (
     count_risk_adding_trades,
     in_construction_window,
@@ -38,34 +38,26 @@ _ACTION_ORDER = {"SELL": 0, "TRIM": 0, "BUY": 1, "HOLD": 2}
 
 
 def _sleeve_utilization(positions, equity):
-    state = positions_state.load()
+    """`positions` are execute.get_positions_with_sleeves()'s resolved
+    dicts — sleeve already resolved once, upstream, via
+    positions_state.reconcile(). No independent lookup here."""
     invested = {"MOMENTUM": 0.0, "QUALITY_VALUE": 0.0, "DEFENSIVE": 0.0}
     for p in positions:
-        sleeve = positions_state.get_sleeve(p.symbol, state)
-        invested[sleeve] = invested.get(sleeve, 0.0) + float(p.market_value)
+        invested[p["sleeve"]] = invested.get(p["sleeve"], 0.0) + p["market_value"]
     if not equity:
         return {sleeve: 0.0 for sleeve in invested}
     return {sleeve: value / equity * 100 for sleeve, value in invested.items()}
 
 
-def _positions_for_risk_state(positions, state):
-    return [
-        {
-            "symbol": p.symbol,
-            "qty": float(p.qty),
-            "market_value": float(p.market_value),
-            "sleeve": positions_state.get_sleeve(p.symbol, state),
-        }
-        for p in positions
-    ]
-
-
 def _risk_state(equity, positions, regime, breaker_status, run_mode, validated_symbols):
+    """`positions` are already execute.get_positions_with_sleeves()'s
+    resolved dicts — they already carry symbol/qty/market_value/sleeve,
+    which is everything risk.py's state["positions"] needs; extra keys
+    (avg_entry_price, opened_at, ...) are harmless passengers it ignores."""
     entries = read_entries()
-    state = positions_state.load()
     return {
         "equity": equity,
-        "positions": _positions_for_risk_state(positions, state),
+        "positions": positions,
         "regime": regime,
         "breaker_status": breaker_status,
         "run_mode": run_mode,
@@ -147,8 +139,8 @@ def _run_light():
     # Stop-losses run unconditionally, breaker or not — they only reduce risk.
     sweep_results = stop_loss_sweep()
 
-    positions = get_positions()
-    held_symbols = sorted({p.symbol for p in positions})
+    positions = get_positions_with_sleeves()
+    held_symbols = sorted({p["symbol"] for p in positions})
 
     # Bars are fetched for the whole universe, not just held symbols + SPY/QQQ
     # — briefing._neighborhood() needs each held symbol's sector ETF and peer
@@ -196,7 +188,7 @@ def _run_light():
     risk_state = _risk_state(equity, positions, regime, breaker_status, "LIGHT", set(universe_data.keys()))
     enriched = _validate_and_execute(candidates, risk_state, "LIGHT")
 
-    final_positions = get_positions()
+    final_positions = get_positions_with_sleeves()
     final_equity = get_equity()
     journal_brain_run(
         "LIGHT", regime, breaker_status, enriched, sweep_results, final_positions, final_equity, result.get("usage") or {}
@@ -222,7 +214,7 @@ def _run_full():
     # path that trades for real (step 13 retires v0 execution).
     v0_signals = {symbol: generate_signal(universe_data[symbol], regime) for symbol in symbols}
 
-    positions = get_positions()
+    positions = get_positions_with_sleeves()
     ticker_headlines = get_ticker_headlines(symbols, cap=HEADLINES_PER_TICKER_CAP)
     macro_headlines = get_macro_headlines(cap=HEADLINES_MACRO_CAP)
 
@@ -254,7 +246,7 @@ def _run_full():
     # — never at decision-time prices.
     enriched = _validate_and_execute(candidates, risk_state, "FULL")
 
-    final_positions = get_positions()
+    final_positions = get_positions_with_sleeves()
     final_equity = get_equity()
     journal_brain_run(
         "FULL",
@@ -346,7 +338,7 @@ def _dry_run():
     journal_entries = read_entries()
     equity = get_equity()
     breaker_status = check_circuit_breakers(journal_entries, equity)
-    positions = get_positions()
+    positions = get_positions_with_sleeves()
 
     bars = get_daily_bars(symbols, days=FULL_RUN_BAR_DAYS)
     universe_data = get_indicators(bars)
