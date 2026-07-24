@@ -16,3 +16,5 @@
 2026-07-23T20:19:55.058763+00:00 env=paper regime=MIXED breaker=TRADING_OK symbols=46 submitted=0 rejected=1 skipped=0 positions=0 equity=5000.00
 2026-07-24T16:53:15.584210+00:00 env=paper type=token_usage run_mode=LIGHT model=claude-haiku-4-5 input=2173 output=869 cache_read=0 cache_write=0
 2026-07-24T16:53:15.603166+00:00 env=paper type=light_run regime=MIXED breaker=TRADING_OK candidates=1 approved=1 rejected=0 submitted=0 sweep_events=0 positions=1 equity=5000.00
+2026-07-24T18:09:07.723203+00:00 env=paper type=token_usage run_mode=LIGHT model=claude-haiku-4-5 input=2174 output=1800 cache_read=0 cache_write=0
+2026-07-24T18:09:07.743769+00:00 env=paper type=light_run regime=MIXED breaker=TRADING_OK candidates=0 approved=0 rejected=0 submitted=0 sweep_events=0 positions=1 equity=5000.00
