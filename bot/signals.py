@@ -1,4 +1,4 @@
-def _ema(closes, span):
+def ema(closes, span):
     return closes.ewm(span=span, adjust=False).mean()
 
 
@@ -17,10 +17,10 @@ def get_indicators(bars):
     for symbol in bars.index.get_level_values(0).unique():
         closes = bars.loc[symbol]["close"]
 
-        ema9 = _ema(closes, 9)
-        ema21 = _ema(closes, 21)
-        ema50 = _ema(closes, 50)
-        ema200 = _ema(closes, 200)
+        ema9 = ema(closes, 9)
+        ema21 = ema(closes, 21)
+        ema50 = ema(closes, 50)
+        ema200 = ema(closes, 200)
         rsi14 = _rsi14(closes)
 
         prev_diff = ema9.iloc[-2] - ema21.iloc[-2]
@@ -44,6 +44,7 @@ def get_indicators(bars):
             "rsi14": rsi14.iloc[-1],
             "cross": cross,
             "pct_from_ema200": (close / ema200_latest - 1) * 100,
+            "pct_1d": (close / closes.iloc[-2] - 1) * 100,
         }
     return indicators
 
@@ -52,8 +53,8 @@ def get_regime(spy_bars, qqq_bars):
     spy_close = spy_bars["close"]
     qqq_close = qqq_bars["close"]
 
-    spy_above = spy_close.iloc[-1] > _ema(spy_close, 50).iloc[-1]
-    qqq_above = qqq_close.iloc[-1] > _ema(qqq_close, 50).iloc[-1]
+    spy_above = spy_close.iloc[-1] > ema(spy_close, 50).iloc[-1]
+    qqq_above = qqq_close.iloc[-1] > ema(qqq_close, 50).iloc[-1]
 
     if spy_above and qqq_above:
         return "RISK_ON"

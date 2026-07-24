@@ -69,6 +69,30 @@ def symbols_in_cooldown(entries, cooldown_days, action="BUY"):
     return cooling
 
 
+def position_opened_date(entries, symbol):
+    """First timestamp of the current unbroken streak of holding `symbol`.
+
+    There is no dedicated positions_state.json yet (that lands with sleeve
+    tagging in a later step), so "days held" for the briefing is derived
+    from the journal's own historical position snapshots: walk runs
+    newest-first, keep going back while the symbol is still held, and return
+    the timestamp of the oldest run in that unbroken streak. Returns None if
+    the symbol isn't currently held or has no journal history.
+    """
+    dated = sorted(
+        (e for e in entries if "timestamp" in e and "positions" in e),
+        key=lambda e: e["timestamp"],
+        reverse=True,
+    )
+    opened_at = None
+    for e in dated:
+        held = any(p["symbol"] == symbol and float(p.get("qty", 0)) != 0 for p in e["positions"])
+        if not held:
+            break
+        opened_at = e["timestamp"]
+    return opened_at
+
+
 def _positions_payload(positions):
     return [
         {
@@ -109,6 +133,35 @@ def journal_run(regime, analyzed, actions, positions, equity, breaker_status):
     )
     _append(RUN_HISTORY_PATH, summary)
 
+    return record
+
+
+def journal_token_usage(run_mode, model, section_estimates, usage):
+    """Record one brain.py API call's token spend, by section, for the cost cap (G11/§5).
+
+    A distinct record type (no "equity"/"actions" keys) so it's invisible to
+    the equity- and trade-history readers above (get_ramp_cap_pct,
+    count_trades_today, symbols_in_cooldown all key off fields this record
+    doesn't have). Logged for dry runs too — cost visibility shouldn't depend
+    on whether the run was allowed to execute.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    record = {
+        "timestamp": timestamp,
+        "env": ENV,
+        "type": "token_usage",
+        "run_mode": run_mode,
+        "model": model,
+        "section_estimates": section_estimates,
+        "usage": usage,
+    }
+    _append(JOURNAL_PATH, json.dumps(record, default=str))
+    _append(
+        RUN_HISTORY_PATH,
+        f"{timestamp} env={ENV} type=token_usage run_mode={run_mode} model={model} "
+        f"input={usage.get('input_tokens')} output={usage.get('output_tokens')} "
+        f"cache_read={usage.get('cache_read_input_tokens')} cache_write={usage.get('cache_creation_input_tokens')}",
+    )
     return record
 
 
