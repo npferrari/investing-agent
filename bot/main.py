@@ -3,14 +3,12 @@ import logging
 import sys
 import traceback
 
-from alpaca.trading.enums import TimeInForce
-
 from bot import brain
 from bot.breakers import TRADING_OK, check_circuit_breakers
 from bot.briefing import build_briefing
 from bot.config import HEADLINES_MACRO_CAP, HEADLINES_PER_TICKER_CAP, SLIPPAGE_HAIRCUT_PCT, UNIVERSE
 from bot.data import get_daily_bars
-from bot.execute import execute_order, get_equity, get_positions_with_sleeves, stop_loss_sweep
+from bot.execute import execute_order, get_equity, get_positions_with_sleeves, reconcile_pending_fills, stop_loss_sweep
 from bot.journal import (
     count_risk_adding_trades,
     in_construction_window,
@@ -87,7 +85,7 @@ def _with_slippage_estimate(execution):
     }
 
 
-def _validate_and_execute(candidates, risk_state, run_mode):
+def _validate_and_execute(candidates, risk_state):
     """risk.py verdicts, then execution for anything APPROVED and actionable.
 
     Returns candidates enriched with "verdict" and "execution", in
@@ -97,8 +95,6 @@ def _validate_and_execute(candidates, risk_state, run_mode):
     proposals = _flatten_proposals(candidates)
     verdicts_by_symbol = {v["symbol"]: v for v in validate_proposals(proposals, risk_state)}
 
-    time_in_force = TimeInForce.OPG if run_mode == "FULL" else TimeInForce.DAY
-
     ordered = sorted(candidates, key=lambda c: _ACTION_ORDER.get(c["proposal"]["action"], 2))
     enriched = []
     for candidate in ordered:
@@ -106,7 +102,13 @@ def _validate_and_execute(candidates, risk_state, run_mode):
         verdict = verdicts_by_symbol[symbol]
         execution = None
         if verdict["status"] == "APPROVED" and verdict["action"] != "HOLD":
-            execution = execute_order(symbol, verdict["action"], verdict["usd_amount"], verdict["sleeve"], time_in_force=time_in_force)
+            # DAY market order regardless of run_mode — execute_order() no
+            # longer needs OPG to submit off-hours (verified live 2026-07-25
+            # that Alpaca queues a notional DAY order submitted while closed
+            # for the next open instead of rejecting it), and OPG rejects
+            # fractional/notional orders outright, which a FULL run's
+            # brain-sized usd_amount BUYs always are.
+            execution = execute_order(symbol, verdict["action"], verdict["usd_amount"], verdict["sleeve"])
             execution = _with_slippage_estimate(execution)
         enriched.append(
             {
@@ -136,6 +138,13 @@ def _run_light():
     if breaker_status != TRADING_OK:
         logger.warning("Circuit breaker active: %s — BUYs will be rejected this run.", breaker_status)
 
+    # Resolve any order a previous run submitted but couldn't confirm filled
+    # at the time (the normal case for a FULL run's overnight DAY orders) —
+    # unconditional and first, same as stop_loss_sweep below, since it's
+    # just journaling what already happened and doesn't depend on anything
+    # else in this run.
+    fill_results = reconcile_pending_fills()
+
     # Stop-losses run unconditionally, breaker or not — they only reduce risk.
     sweep_results = stop_loss_sweep()
 
@@ -155,7 +164,7 @@ def _run_light():
 
     if not held_symbols:
         logger.info("LIGHT run: no held positions — nothing to monitor.")
-        journal_brain_run("LIGHT", regime, breaker_status, [], sweep_results, positions, equity, {})
+        journal_brain_run("LIGHT", regime, breaker_status, [], sweep_results, positions, equity, {}, fill_results=fill_results)
         return
 
     # Held positions only — no discovery candidates. Light runs never open
@@ -186,12 +195,20 @@ def _run_light():
 
     candidates = result["candidates"] or []
     risk_state = _risk_state(equity, positions, regime, breaker_status, "LIGHT", set(universe_data.keys()))
-    enriched = _validate_and_execute(candidates, risk_state, "LIGHT")
+    enriched = _validate_and_execute(candidates, risk_state)
 
     final_positions = get_positions_with_sleeves()
     final_equity = get_equity()
     journal_brain_run(
-        "LIGHT", regime, breaker_status, enriched, sweep_results, final_positions, final_equity, result.get("usage") or {}
+        "LIGHT",
+        regime,
+        breaker_status,
+        enriched,
+        sweep_results,
+        final_positions,
+        final_equity,
+        result.get("usage") or {},
+        fill_results=fill_results,
     )
 
 
@@ -201,6 +218,9 @@ def _run_full():
     breaker_status = check_circuit_breakers(entries, equity)
     if breaker_status != TRADING_OK:
         logger.warning("Circuit breaker active: %s — BUYs will be rejected this run.", breaker_status)
+
+    # See _run_light's identical call for why this runs first, unconditionally.
+    fill_results = reconcile_pending_fills()
 
     sweep_results = stop_loss_sweep()
 
@@ -242,9 +262,11 @@ def _run_full():
 
     candidates = full_result["candidates"] or []
     risk_state = _risk_state(equity, positions, regime, breaker_status, "FULL", set(universe_data.keys()))
-    # SELLs before BUYs, submitted market-on-open (OPG) for the next session
-    # — never at decision-time prices.
-    enriched = _validate_and_execute(candidates, risk_state, "FULL")
+    # SELLs before BUYs. A FULL run's BUYs are submitted overnight as DAY
+    # market orders — Alpaca queues them for the next session's open rather
+    # than filling at tonight's decision-time price; reconcile_pending_fills()
+    # journals the real fill and its slippage the next time anything runs.
+    enriched = _validate_and_execute(candidates, risk_state)
 
     final_positions = get_positions_with_sleeves()
     final_equity = get_equity()
@@ -259,6 +281,7 @@ def _run_full():
         full_result.get("usage") or {},
         briefing_sections=briefing["sections"],
         v0_signals=v0_signals,
+        fill_results=fill_results,
     )
 
 

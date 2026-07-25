@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from bot import positions_state
+from bot import pending_fills, positions_state
 from bot.config import (
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
@@ -29,6 +29,18 @@ _ALL_SYMBOLS = set(UNIVERSE["STOCKS"]) | set(UNIVERSE["ETFS"]) | set(UNIVERSE["H
 
 STOP_LOSS = "STOP_LOSS"
 STOP_ANOMALY = "STOP_ANOMALY"
+
+# Terminal states an order can land in without ever filling — anything here
+# means a pending_fills.json entry is done (no more filling coming) but
+# resolved as a failure, not a fill, when reconcile_pending_fills() checks it.
+_UNFILLED_TERMINAL_STATUSES = {
+    OrderStatus.CANCELED,
+    OrderStatus.EXPIRED,
+    OrderStatus.REJECTED,
+    OrderStatus.DONE_FOR_DAY,
+    OrderStatus.STOPPED,
+    OrderStatus.SUSPENDED,
+}
 
 
 def get_positions():
@@ -93,16 +105,14 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
     if symbol not in _ALL_SYMBOLS:
         return _reject(symbol, action, usd_amount, sleeve, f"{symbol} is outside UNIVERSE")
 
-    clock = _trading_client.get_clock()
-    # DAY orders need the market open right now. Market-on-open (OPG) orders
-    # are, by design, submitted while the market is closed (queued for the
-    # next session) — gating them on is_open would reject the exact use case
-    # they exist for. Alpaca enforces its own OPG submission window; let the
-    # API reject an out-of-window OPG order rather than second-guessing that
-    # window here.
-    if time_in_force == TimeInForce.DAY and not clock.is_open:
-        return _reject(symbol, action, usd_amount, sleeve, "market is closed")
-
+    # No local "is the market open" gate here (there was one, checked
+    # locally, before 2026-07-25) — verified live that a notional DAY order
+    # submitted while the market is closed is ACCEPTED by Alpaca and queued
+    # for the next session's open rather than rejected, so second-guessing
+    # that here would just reject the exact case this function needs to
+    # handle. Let Alpaca's own submit_order call below be the judge, same as
+    # the OPG-window handling already does.
+    #
     # Quote is fetched and logged for every order attempt that reaches here,
     # independent of accept/reject, so spread + slippage vs. this reference
     # price can be reconstructed later from the fill.
@@ -193,6 +203,26 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
     elif action == "SELL":
         positions_state.record_close(symbol)
 
+    # A DAY order queued off-hours (or any market order that just hasn't
+    # cleared yet) doesn't have a real fill price at this point — order.id is
+    # recorded so reconcile_pending_fills() can look up the actual fill on a
+    # later run and journal real slippage vs. this decision-time price,
+    # rather than the analytical haircut estimate main.py applies elsewhere.
+    if order.filled_at is None:
+        pending_fills.add(
+            {
+                "order_id": str(order.id),
+                "symbol": symbol,
+                "action": action,
+                "sleeve": sleeve,
+                "usd_amount": usd_amount,
+                "order_value": order_value,
+                "decision_price": price,
+                "decision_quote": quote_log,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
     return {
         "status": "SUBMITTED",
         "symbol": symbol,
@@ -206,6 +236,111 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
         "quote": quote_log,
         "order_id": str(order.id),
     }
+
+
+def reconcile_pending_fills():
+    """Resolve every order execute_order() couldn't confirm filled at
+    submission time (logs/pending_fills.json — see the comment where entries
+    are added, above). Called once at the start of every run, light or full,
+    before that run's own candidates are even screened, so a full run's
+    overnight DAY-order fills get journaled the next time anything runs.
+
+    Filled -> real slippage vs. the decision-time quote, journaled (not the
+    analytical haircut main.py applies elsewhere — an actual fill price).
+    Landed in a terminal state without filling (canceled/expired/rejected/
+    stopped/suspended/done-for-day) -> a loud failure: logged at ERROR and
+    paged via an auto-opened GitHub issue, same treatment stop_loss_sweep's
+    STOP_ANOMALY gets, because an approved trade that silently never
+    happened is exactly the kind of failure that must not stay quiet.
+    Still open (still queued, no terminal status yet) -> left for the next
+    run to check again.
+    """
+    pending = pending_fills.load()
+    if not pending:
+        return []
+
+    results = []
+    still_pending = []
+    for entry in pending:
+        try:
+            order = _trading_client.get_order_by_id(entry["order_id"])
+        except APIError as exc:
+            logger.error(
+                "Could not fetch order %s (%s %s) for fill reconciliation: %s — will retry next run",
+                entry["order_id"],
+                entry["action"],
+                entry["symbol"],
+                exc,
+            )
+            still_pending.append(entry)
+            continue
+
+        if order.filled_at is not None:
+            fill_price = float(order.filled_avg_price)
+            decision_price = entry["decision_price"]
+            raw_pct = (fill_price - decision_price) / decision_price * 100
+            # Positive slippage_cost_pct always means "cost us money": paying
+            # more than the decision-time price on a BUY, or receiving less
+            # than it on a SELL.
+            slippage_cost_pct = raw_pct if entry["action"] == "BUY" else -raw_pct
+            result = {
+                "status": "FILLED",
+                "order_id": entry["order_id"],
+                "symbol": entry["symbol"],
+                "action": entry["action"],
+                "sleeve": entry["sleeve"],
+                "decision_price": decision_price,
+                "fill_price": fill_price,
+                "slippage_cost_pct": slippage_cost_pct,
+                "slippage_cost_usd": entry["order_value"] * slippage_cost_pct / 100,
+                "submitted_at": entry["submitted_at"],
+                "filled_at": str(order.filled_at),
+            }
+            logger.info(
+                "FILL RECONCILED %s %s: decision=%.2f fill=%.2f slippage=%.3f%% (~$%.2f)",
+                entry["action"],
+                entry["symbol"],
+                decision_price,
+                fill_price,
+                slippage_cost_pct,
+                result["slippage_cost_usd"],
+            )
+            results.append(result)
+        elif order.status in _UNFILLED_TERMINAL_STATUSES:
+            logger.error(
+                "PENDING ORDER NEVER FILLED: %s %s (order_id=%s) ended %s without filling",
+                entry["action"],
+                entry["symbol"],
+                entry["order_id"],
+                order.status,
+            )
+            result = {
+                "status": str(order.status),
+                "order_id": entry["order_id"],
+                "symbol": entry["symbol"],
+                "action": entry["action"],
+                "sleeve": entry["sleeve"],
+                "decision_price": entry["decision_price"],
+                "fill_price": None,
+                "submitted_at": entry["submitted_at"],
+            }
+            results.append(result)
+            _open_github_issue(
+                title=f"Order never filled: {entry['action']} {entry['symbol']} ended {order.status}",
+                body=(
+                    f"{entry['action']} {entry['symbol']} (~${entry['order_value']:.2f}, sleeve="
+                    f"{entry['sleeve']}) was submitted at {entry['submitted_at']} (order_id="
+                    f"{entry['order_id']}) but never filled — ended in status {order.status}.\n\n"
+                    "This is a queued off-hours DAY order that should have filled at/near the "
+                    "next session's open; it didn't. Check the account/order in the Alpaca "
+                    "dashboard for the real reason before assuming this will resolve itself."
+                ),
+            )
+        else:
+            still_pending.append(entry)
+
+    pending_fills.save(still_pending)
+    return results
 
 
 def _open_github_issue(title, body):

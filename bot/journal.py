@@ -190,6 +190,7 @@ def journal_brain_run(
     token_usage,
     briefing_sections=None,
     v0_signals=None,
+    fill_results=None,
 ):
     """The full paper trail for one LIGHT or FULL run: every forecast (with
     its expiry, for scorecard.py to grade once it exists), every proposal
@@ -206,11 +207,19 @@ def journal_brain_run(
     `briefing_sections` / `v0_signals` are FULL-run-only (None for LIGHT):
     a light run never screens the discovery universe or computes v0's
     benchmark signal, so there's nothing to log for either.
+
+    `fill_results` is execute.reconcile_pending_fills()'s return value for
+    *this* run — orders a previous run submitted but couldn't confirm filled
+    at the time, resolved now (filled, with real slippage vs. the
+    decision-time price; or a terminal failure that never filled at all).
+    Unrelated to this run's own candidates/actions, which is why it's kept
+    as its own top-level field rather than folded into `actions`.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     positions_payload = _positions_payload(positions)
     actions = _actions_from_candidates(candidates)
     forecast_ledger = _forecast_ledger_rows(candidates, timestamp, run_mode)
+    fill_results = fill_results or []
 
     record = {
         "timestamp": timestamp,
@@ -222,6 +231,7 @@ def journal_brain_run(
         "candidates": candidates,
         "forecast_ledger": forecast_ledger,
         "actions": actions,
+        "fill_results": fill_results,
         "positions": positions_payload,
         "equity": equity,
         "token_usage": token_usage,
@@ -236,9 +246,19 @@ def journal_brain_run(
     approved = sum(1 for c in candidates if c["verdict"]["status"] == "APPROVED")
     rejected = sum(1 for c in candidates if c["verdict"]["status"] == "REJECTED")
     submitted = sum(1 for a in actions if a["status"] == "SUBMITTED")
+    # Distinct from `rejected` above (a risk.py verdict rejection, before
+    # execution is ever attempted): this counts an *approved* order that
+    # then bounced at the broker — e.g. the 2026-07-25 OPG/fractional bug,
+    # where approved=9 rejected=3 submitted=0 gave no way to tell "nothing
+    # was approved" apart from "something was approved and silently failed
+    # to place" without reading the full journal record.
+    execution_rejected = sum(1 for a in actions if a["status"] == "REJECTED")
+    filled = sum(1 for f in fill_results if f["status"] == "FILLED")
+    fill_failed = len(fill_results) - filled
     summary = (
         f"{timestamp} env={ENV} type={run_mode.lower()}_run regime={regime} breaker={breaker_status} "
         f"candidates={len(candidates)} approved={approved} rejected={rejected} submitted={submitted} "
+        f"execution_rejected={execution_rejected} fills_reconciled={filled} fills_failed={fill_failed} "
         f"sweep_events={len(sweep_results)} positions={len(positions_payload)} equity={equity:.2f}"
     )
     _append(RUN_HISTORY_PATH, summary)
