@@ -169,10 +169,20 @@ jobs:
               tb = f'Could not read logs/journal.jsonl: {e}'
           with open('issue_traceback.txt', 'w') as f:
               f.write(tb)
+          try:
+              with open('logs/journal.jsonl') as f:
+                  lines = [l.rstrip('\n') for l in f if l.strip()]
+              recent = '\n'.join(lines[-20:]) or '(journal.jsonl is empty)'
+          except Exception as e:
+              recent = f'Could not read logs/journal.jsonl: {e}'
+          with open('issue_recent_journal.txt', 'w') as f:
+              f.write(recent)
           "
           printf 'Scheduled/manual run failed.\n\nRun: %s\n\n```\n' "$RUN_URL" > issue_body.md
           cat issue_traceback.txt >> issue_body.md
-          printf '\n```\n' >> issue_body.md
+          printf '\n```\n\n<details><summary>Last 20 logs/journal.jsonl lines</summary>\n\n```\n' >> issue_body.md
+          cat issue_recent_journal.txt >> issue_body.md
+          printf '\n```\n\n</details>\n' >> issue_body.md
           gh issue create \
             --title "Trading bot run failed: $(date -u +'%Y-%m-%d %H:%M UTC')" \
             --body-file issue_body.md

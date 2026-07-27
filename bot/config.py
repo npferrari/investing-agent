@@ -125,6 +125,33 @@ SLIPPAGE_HAIRCUT_PCT = 0.05
 STOP_CONFIRM_DELAY_SECONDS = 30
 STOP_ANOMALY_SINGLE_DAY_PCT = 15
 
+# $/MTok — the single source of truth for estimating journaled token spend
+# (journal.today_token_cost_usd, checked against RISK["daily_cost_cap_usd"]
+# before every brain call) and for scripts/journal_report.py's digest.
+# Update here when Anthropic pricing changes; nothing else should hardcode
+# a rate. Sonnet 5 is at 2026 intro pricing ($2/$10, in effect through
+# 2026-08-31) — revert to $3/$15 after that date.
+PRICING_PER_MTOK = {
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+}
+# Every brain.py call uses the default 5-minute ephemeral cache (no ttl
+# override) — 1.25x write, 0.1x read, both off the model's input price.
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.10
+
+# §5's per-run input-token budget: a single briefing (any run mode) exceeding
+# this is a real cost-drift signal worth a loud TOKEN_BUDGET_WARN, not
+# something to notice only once the daily cost cap trips.
+TOKEN_BUDGET_INPUT = 8000
+
+# Every external API call in this codebase (Alpaca market data/news/trading
+# reads, Anthropic) retries through bot.retry.call_with_retry with these
+# defaults — see that module's docstring for why execute.submit_order is the
+# one call deliberately excluded.
+API_RETRY_MAX_ATTEMPTS = 3
+API_RETRY_BASE_DELAY_SECONDS = 1.0
+
 # Screener/briefing budgets (T2, T6).
 MAX_CANDIDATES_NEW = 12  # discovery slots; held positions ride along uncapped
 HEADLINES_PER_TICKER_CAP = 5

@@ -10,7 +10,9 @@ from bot.config import (
     BRAIN_MODEL_LIGHT,
     OUTPUT_TOKENS_PER_CANDIDATE,
     SHADOW_MODEL,
+    TOKEN_BUDGET_INPUT,
 )
+from bot.retry import call_with_retry
 
 logger = logging.getLogger("bot.brain")
 
@@ -138,19 +140,21 @@ def _call(model, user_text, max_tokens, effort=None, disable_thinking=False):
 
 
 def _parse_candidates(response):
-    """None on any failure — G10: broken output always falls back to HOLD, never a retry-with-improvisation."""
+    """(candidates, error) — error is None on success, the literal string
+    "refusal" for a policy refusal (retrying with a corrected prompt can't
+    fix a policy decision, so _run doesn't attempt it), or a descriptive
+    parse-failure string otherwise (worth _run's one JSON-retry — G10's
+    fallback-to-HOLD is still the backstop if that retry also fails)."""
     if response.stop_reason == "refusal":
         logger.warning("Brain call refused: %s", getattr(response, "stop_details", None))
-        return None
+        return None, "refusal"
     text = next((b.text for b in response.content if b.type == "text"), None)
     if text is None:
-        logger.warning("Brain response had no text block (stop_reason=%s)", response.stop_reason)
-        return None
+        return None, f"no text block in response (stop_reason={response.stop_reason})"
     try:
-        return json.loads(text)["candidates"]
+        return json.loads(text)["candidates"], None
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        logger.warning("Brain output failed to parse despite schema constraint: %s", exc)
-        return None
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def _run(model, briefing_text, sections, candidate_count, effort, disable_thinking=False, max_tokens=None):
@@ -168,29 +172,63 @@ def _run(model, briefing_text, sections, candidate_count, effort, disable_thinki
         # enough even at n=1, let alone n>1 where one verbose candidate can
         # crowd out every other candidate's tokens in the same response).
         max_tokens = max(900, candidate_count * OUTPUT_TOKENS_PER_CANDIDATE)
-    try:
-        response = _call(model, briefing_text, max_tokens, effort=effort, disable_thinking=disable_thinking)
-    except anthropic.APIError as exc:
-        logger.error("Brain API call failed (%s) — falling back to HOLD.", exc)
-        return {
-            "model": model,
-            "candidates": None,
-            "fallback": True,
-            "usage": None,
-            "section_estimates": {name: _estimate_tokens(t) for name, t in sections.items()},
-        }
 
-    candidates = _parse_candidates(response)
+    def _attempt(text):
+        # call_with_retry already retries transient network/5xx/429 failures
+        # 3x with backoff (bot/retry.py) before this except ever sees them —
+        # reaching here means the brain is genuinely unavailable this run.
+        try:
+            response = call_with_retry(_call, model, text, max_tokens, effort=effort, disable_thinking=disable_thinking)
+        except anthropic.APIError as exc:
+            logger.error("Brain API call failed after retries (%s).", exc)
+            return None, None, f"api_error: {exc}"
+        candidates, error = _parse_candidates(response)
+        return response, candidates, error
+
+    response, candidates, error = _attempt(briefing_text)
+
+    # One retry with the parse error appended — only for a response that
+    # actually came back but didn't parse (not an exhausted API retry, and
+    # not a refusal, neither of which a corrected prompt can fix).
+    retried_json = False
+    if response is not None and candidates is None and error != "refusal":
+        retried_json = True
+        retry_text = (
+            f"{briefing_text}\n\nYour previous response failed to parse: {error}. "
+            "Return ONLY valid JSON matching the required schema — no other text, no explanation."
+        )
+        response, candidates, error = _attempt(retry_text)
+
+    fallback = candidates is None
+    if fallback:
+        logger.error(
+            "FALLBACK_HOLD (%s): %s%s", model, error, " (after 1 JSON retry)" if retried_json else ""
+        )
+
+    usage = _usage_dict(response) if response is not None else None
+    section_estimates = {name: _estimate_tokens(t) for name, t in sections.items()}
+    if usage is not None:
+        section_estimates["system_prompt"] = _estimate_tokens(SYSTEM_PROMPT)
+        section_estimates["output"] = usage["output_tokens"]
+
+    token_budget_warn = usage is not None and usage["input_tokens"] > TOKEN_BUDGET_INPUT
+    if token_budget_warn:
+        logger.warning(
+            "TOKEN_BUDGET_WARN (%s): input_tokens=%d exceeds the §5 budget of %d — sections: %s",
+            model,
+            usage["input_tokens"],
+            TOKEN_BUDGET_INPUT,
+            section_estimates,
+        )
+
     return {
         "model": model,
         "candidates": candidates,
-        "fallback": candidates is None,
-        "usage": _usage_dict(response),
-        "section_estimates": {
-            **{name: _estimate_tokens(t) for name, t in sections.items()},
-            "system_prompt": _estimate_tokens(SYSTEM_PROMPT),
-            "output": _usage_dict(response)["output_tokens"],
-        },
+        "fallback": fallback,
+        "fallback_reason": error if fallback else None,
+        "usage": usage,
+        "section_estimates": section_estimates,
+        "token_budget_warn": token_budget_warn,
     }
 
 
@@ -198,6 +236,22 @@ def run_full_analysis(briefing, candidate_count, effort="medium"):
     """Sonnet, full judgment. `briefing` is briefing.build_briefing()'s return value."""
     result = _run(
         BRAIN_MODEL_FULL, briefing["text"], briefing["sections"], candidate_count, effort, disable_thinking=True
+    )
+    # A FULL run is one batch call for every candidate, so a fallback/warn
+    # here applies to the whole run, not one symbol — "ALL" marks that,
+    # matching run_light_analysis's per-symbol event shape for journal.py.
+    result["fallback_events"] = [{"symbol": "ALL", "reason": result["fallback_reason"]}] if result["fallback"] else []
+    result["token_budget_warnings"] = (
+        [
+            {
+                "symbol": "ALL",
+                "model": result["model"],
+                "input_tokens": result["usage"]["input_tokens"],
+                "section_estimates": result["section_estimates"],
+            }
+        ]
+        if result["token_budget_warn"]
+        else []
     )
 
     shadow = None
@@ -267,6 +321,8 @@ def run_light_analysis(briefing, candidate_symbols):
     }
     section_estimates_total = {}
     candidates = []
+    fallback_events = []
+    token_budget_warnings = []
 
     for symbol in candidate_symbols:
         focused_text = (
@@ -286,6 +342,16 @@ def run_light_analysis(briefing, candidate_symbols):
             for name, tokens in result["section_estimates"].items():
                 section_estimates_total[name] = section_estimates_total.get(name, 0) + tokens
 
+        if result["token_budget_warn"]:
+            token_budget_warnings.append(
+                {
+                    "symbol": symbol,
+                    "model": BRAIN_MODEL_LIGHT,
+                    "input_tokens": result["usage"]["input_tokens"],
+                    "section_estimates": result["section_estimates"],
+                }
+            )
+
         # Keep only the entry matching the symbol this call actually asked
         # about — verified live 2026-07-24: despite "return exactly one
         # entry ... for {symbol} only", a single-symbol focused call can
@@ -296,10 +362,13 @@ def run_light_analysis(briefing, candidate_symbols):
         if matches:
             candidates.append(matches[0])
         else:
+            reason = result.get("fallback_reason") or "no matching entry for symbol in response"
+            fallback_events.append({"symbol": symbol, "reason": reason})
             logger.error(
-                "Light run call for %s failed or returned no matching entry — no proposal "
-                "for %s this run (FALLBACK_HOLD: doing nothing is always safe).",
+                "FALLBACK_HOLD for %s: %s — no proposal for %s this run "
+                "(doing nothing is always safe).",
                 symbol,
+                reason,
                 symbol,
             )
 
@@ -322,4 +391,6 @@ def run_light_analysis(briefing, candidate_symbols):
         "fallback": not candidates,
         "usage": usage_total,
         "section_estimates": section_estimates_total,
+        "fallback_events": fallback_events,
+        "token_budget_warnings": token_budget_warnings,
     }

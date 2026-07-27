@@ -6,6 +6,7 @@ from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 
 from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from bot.retry import call_with_retry
 
 _client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
@@ -22,7 +23,7 @@ def get_daily_bars(symbols, days):
         start=datetime.now(timezone.utc) - timedelta(days=days),
         adjustment=_ADJUSTMENT,
     )
-    return _client.get_stock_bars(request).df
+    return call_with_retry(_client.get_stock_bars, request).df
 
 
 def get_intraday_bars(symbols, minutes):
@@ -32,9 +33,9 @@ def get_intraday_bars(symbols, minutes):
         start=datetime.now(timezone.utc) - timedelta(minutes=minutes),
         adjustment=_ADJUSTMENT,
     )
-    return _client.get_stock_bars(request).df
+    return call_with_retry(_client.get_stock_bars, request).df
 
 
 def get_latest_quote(symbols):
     request = StockLatestQuoteRequest(symbol_or_symbols=symbols)
-    return _client.get_stock_latest_quote(request)
+    return call_with_retry(_client.get_stock_latest_quote, request)

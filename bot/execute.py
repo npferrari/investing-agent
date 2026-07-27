@@ -20,6 +20,7 @@ from bot.config import (
 )
 from bot.data import get_daily_bars, get_latest_quote
 from bot.journal import get_ramp_cap_pct, read_entries
+from bot.retry import call_with_retry
 
 logger = logging.getLogger("bot.execute")
 
@@ -44,7 +45,7 @@ _UNFILLED_TERMINAL_STATUSES = {
 
 
 def get_positions():
-    return _trading_client.get_all_positions()
+    return call_with_retry(_trading_client.get_all_positions)
 
 
 def get_positions_with_sleeves():
@@ -72,7 +73,7 @@ def get_positions_with_sleeves():
 
 
 def get_equity():
-    return float(_trading_client.get_account().equity)
+    return float(call_with_retry(_trading_client.get_account).equity)
 
 
 def _reject(symbol, action, usd_amount, sleeve, reason, quote=None):
@@ -127,7 +128,7 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
     # tracks usd_amount exactly. Alpaca rejects notional orders for
     # non-fractionable instruments, so fall back to a whole-share qty order
     # for those.
-    asset = _trading_client.get_asset(symbol)
+    asset = call_with_retry(_trading_client.get_asset, symbol)
     notional = None
     qty = None
     if asset.fractionable:
@@ -152,7 +153,7 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
         # not one of risk.py's G-checks (it's a v0-era pacing mechanism, not
         # a PRD-numbered guardrail), so it stays here rather than moving.
         equity = get_equity()
-        positions = _trading_client.get_all_positions()
+        positions = call_with_retry(_trading_client.get_all_positions)
         ramp_cap_pct = get_ramp_cap_pct(read_entries())
         invested_value = sum(float(p.market_value) for p in positions)
         invested_after = invested_value + order_value
@@ -180,6 +181,14 @@ def execute_order(symbol, action, usd_amount, sleeve, time_in_force=TimeInForce.
     # outside Alpaca's 7pm-9:28am ET window — verified live 2026-07-29) and
     # must produce a graceful REJECTED result, not an uncaught exception that
     # would crash the whole run and abort every other proposal in the batch.
+    #
+    # Deliberately NOT wrapped in bot.retry.call_with_retry, unlike every
+    # other Alpaca call in this file: a network failure here is genuinely
+    # ambiguous (did the order reach Alpaca before the connection dropped?),
+    # and retrying a mutating, non-idempotent submission on an ambiguous
+    # failure risks placing a duplicate real order. Better to surface it
+    # loudly (an uncaught exception here still fails only this one
+    # candidate, per the comment above) than silently double-buy.
     try:
         order = _trading_client.submit_order(order_request)
     except APIError as exc:
@@ -263,7 +272,7 @@ def reconcile_pending_fills():
     still_pending = []
     for entry in pending:
         try:
-            order = _trading_client.get_order_by_id(entry["order_id"])
+            order = call_with_retry(_trading_client.get_order_by_id, entry["order_id"])
         except APIError as exc:
             logger.error(
                 "Could not fetch order %s (%s %s) for fill reconciliation: %s — will retry next run",

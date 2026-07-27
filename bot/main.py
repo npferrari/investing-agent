@@ -6,16 +6,18 @@ import traceback
 from bot import brain
 from bot.breakers import TRADING_OK, check_circuit_breakers
 from bot.briefing import build_briefing
-from bot.config import HEADLINES_MACRO_CAP, HEADLINES_PER_TICKER_CAP, SLIPPAGE_HAIRCUT_PCT, UNIVERSE
+from bot.config import HEADLINES_MACRO_CAP, HEADLINES_PER_TICKER_CAP, RISK, SLIPPAGE_HAIRCUT_PCT, UNIVERSE
 from bot.data import get_daily_bars
 from bot.execute import execute_order, get_equity, get_positions_with_sleeves, reconcile_pending_fills, stop_loss_sweep
 from bot.journal import (
     count_risk_adding_trades,
     in_construction_window,
     journal_brain_run,
+    journal_cost_cap_skip,
     journal_error,
     journal_token_usage,
     read_entries,
+    today_token_cost_usd,
 )
 from bot.news import get_macro_headlines, get_ticker_headlines
 from bot.risk import validate_proposals
@@ -149,6 +151,23 @@ def _run_light():
     sweep_results = stop_loss_sweep()
 
     positions = get_positions_with_sleeves()
+
+    # G11/§5 cost cap: checked before anything else costs a token (bars,
+    # headlines, the brain call itself) — a capped day skips straight to
+    # journaling, not just skipping the brain after already paying for the
+    # rest of the run's setup.
+    today_cost = today_token_cost_usd(entries)
+    cost_cap = RISK["daily_cost_cap_usd"]
+    if today_cost > cost_cap:
+        logger.error(
+            "COST_CAP_SKIP: today's journaled token cost $%.4f exceeds the $%.2f daily cap — "
+            "skipping the brain call this run (sweep already ran above).",
+            today_cost,
+            cost_cap,
+        )
+        journal_cost_cap_skip("LIGHT", breaker_status, sweep_results, positions, equity, fill_results, today_cost, cost_cap)
+        return
+
     held_symbols = sorted({p["symbol"] for p in positions})
 
     # Bars are fetched for the whole universe, not just held symbols + SPY/QQQ
@@ -209,6 +228,8 @@ def _run_light():
         final_equity,
         result.get("usage") or {},
         fill_results=fill_results,
+        fallback_events=result.get("fallback_events"),
+        token_budget_warnings=result.get("token_budget_warnings"),
     )
 
 
@@ -223,6 +244,21 @@ def _run_full():
     fill_results = reconcile_pending_fills()
 
     sweep_results = stop_loss_sweep()
+    positions = get_positions_with_sleeves()
+
+    # G11/§5 cost cap — see _run_light's identical check for why this runs
+    # before any of the bars/headlines/brain cost is even incurred.
+    today_cost = today_token_cost_usd(entries)
+    cost_cap = RISK["daily_cost_cap_usd"]
+    if today_cost > cost_cap:
+        logger.error(
+            "COST_CAP_SKIP: today's journaled token cost $%.4f exceeds the $%.2f daily cap — "
+            "skipping the brain call this run (sweep already ran above).",
+            today_cost,
+            cost_cap,
+        )
+        journal_cost_cap_skip("FULL", breaker_status, sweep_results, positions, equity, fill_results, today_cost, cost_cap)
+        return
 
     symbols = UNIVERSE["STOCKS"] + UNIVERSE["ETFS"] + UNIVERSE["HEDGE"]
     bars = get_daily_bars(symbols, days=FULL_RUN_BAR_DAYS)
@@ -234,7 +270,6 @@ def _run_full():
     # path that trades for real (step 13 retires v0 execution).
     v0_signals = {symbol: generate_signal(universe_data[symbol], regime) for symbol in symbols}
 
-    positions = get_positions_with_sleeves()
     ticker_headlines = get_ticker_headlines(symbols, cap=HEADLINES_PER_TICKER_CAP)
     macro_headlines = get_macro_headlines(cap=HEADLINES_MACRO_CAP)
 
@@ -282,6 +317,8 @@ def _run_full():
         briefing_sections=briefing["sections"],
         v0_signals=v0_signals,
         fill_results=fill_results,
+        fallback_events=full_result.get("fallback_events"),
+        token_budget_warnings=full_result.get("token_budget_warnings"),
     )
 
 

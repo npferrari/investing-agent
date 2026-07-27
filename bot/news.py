@@ -6,6 +6,7 @@ from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
 
 from bot.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from bot.retry import call_with_retry
 
 _client = NewsClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
@@ -69,7 +70,7 @@ def get_ticker_headlines(symbols, hours=24, cap=5):
         limit=min(len(symbols) * cap * 4, 200),
         include_content=False,
     )
-    articles = _client.get_news(request).data.get("news", [])
+    articles = call_with_retry(_client.get_news, request).data.get("news", [])
     headlines = [_to_headline(article, now) for article in articles]
 
     by_symbol = {symbol: [] for symbol in symbols}
@@ -91,6 +92,6 @@ def get_macro_headlines(hours=24, cap=8):
         limit=max(cap * 4, 50),
         include_content=False,
     )
-    articles = _client.get_news(request).data.get("news", [])
+    articles = call_with_retry(_client.get_news, request).data.get("news", [])
     headlines = [_to_headline(article, now) for article in articles]
     return _dedupe(headlines)[:cap]

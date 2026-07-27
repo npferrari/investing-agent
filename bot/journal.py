@@ -3,7 +3,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from bot.config import ENV, RISK
+from bot.config import CACHE_READ_MULTIPLIER, CACHE_WRITE_MULTIPLIER, ENV, PRICING_PER_MTOK, RISK
 
 LOG_DIR = Path("logs")
 JOURNAL_PATH = LOG_DIR / "journal.jsonl"
@@ -191,6 +191,8 @@ def journal_brain_run(
     briefing_sections=None,
     v0_signals=None,
     fill_results=None,
+    fallback_events=None,
+    token_budget_warnings=None,
 ):
     """The full paper trail for one LIGHT or FULL run: every forecast (with
     its expiry, for scorecard.py to grade once it exists), every proposal
@@ -214,12 +216,20 @@ def journal_brain_run(
     decision-time price; or a terminal failure that never filled at all).
     Unrelated to this run's own candidates/actions, which is why it's kept
     as its own top-level field rather than folded into `actions`.
+
+    `fallback_events` / `token_budget_warnings` come straight from
+    brain.run_full_analysis / run_light_analysis's own return dicts — one
+    entry per symbol (or "ALL" for a FULL run's single batch call) whose
+    brain call ended in FALLBACK_HOLD, or whose input tokens exceeded the
+    §5 budget (bot.config.TOKEN_BUDGET_INPUT).
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     positions_payload = _positions_payload(positions)
     actions = _actions_from_candidates(candidates)
     forecast_ledger = _forecast_ledger_rows(candidates, timestamp, run_mode)
     fill_results = fill_results or []
+    fallback_events = fallback_events or []
+    token_budget_warnings = token_budget_warnings or []
 
     record = {
         "timestamp": timestamp,
@@ -232,6 +242,8 @@ def journal_brain_run(
         "forecast_ledger": forecast_ledger,
         "actions": actions,
         "fill_results": fill_results,
+        "fallback_events": fallback_events,
+        "token_budget_warnings": token_budget_warnings,
         "positions": positions_payload,
         "equity": equity,
         "token_usage": token_usage,
@@ -259,6 +271,7 @@ def journal_brain_run(
         f"{timestamp} env={ENV} type={run_mode.lower()}_run regime={regime} breaker={breaker_status} "
         f"candidates={len(candidates)} approved={approved} rejected={rejected} submitted={submitted} "
         f"execution_rejected={execution_rejected} fills_reconciled={filled} fills_failed={fill_failed} "
+        f"fallback_hold={len(fallback_events)} token_budget_warn={len(token_budget_warnings)} "
         f"sweep_events={len(sweep_results)} positions={len(positions_payload)} equity={equity:.2f}"
     )
     _append(RUN_HISTORY_PATH, summary)
@@ -291,6 +304,67 @@ def journal_token_usage(run_mode, model, section_estimates, usage):
         f"{timestamp} env={ENV} type=token_usage run_mode={run_mode} model={model} "
         f"input={usage.get('input_tokens')} output={usage.get('output_tokens')} "
         f"cache_read={usage.get('cache_read_input_tokens')} cache_write={usage.get('cache_creation_input_tokens')}",
+    )
+    return record
+
+
+def _model_cost_usd(model, usage):
+    pricing = PRICING_PER_MTOK.get(model)
+    if pricing is None or not usage:
+        return 0.0
+    return (
+        usage.get("input_tokens", 0) * pricing["input"]
+        + usage.get("output_tokens", 0) * pricing["output"]
+        + usage.get("cache_creation_input_tokens", 0) * pricing["input"] * CACHE_WRITE_MULTIPLIER
+        + usage.get("cache_read_input_tokens", 0) * pricing["input"] * CACHE_READ_MULTIPLIER
+    ) / 1_000_000
+
+
+def today_token_cost_usd(entries):
+    """Sum of every token_usage record's estimated cost (bot.config's
+    PRICING_PER_MTOK) journaled so far today (UTC). main.py's G11/§5 cost-cap
+    check reads this *before* calling the brain at all, so a capped day
+    skips the API call entirely rather than paying for it and rejecting the
+    result afterward."""
+    today = datetime.now(timezone.utc).date()
+    total = 0.0
+    for e in entries:
+        if e.get("type") != "token_usage":
+            continue
+        ts = e.get("timestamp")
+        if not ts or datetime.fromisoformat(ts).date() != today:
+            continue
+        total += _model_cost_usd(e.get("model"), e.get("usage") or {})
+    return total
+
+
+def journal_cost_cap_skip(run_mode, breaker_status, sweep_results, positions, equity, fill_results, today_cost, cap):
+    """A distinct record type for the G11/§5 cost-cap trip: the brain was
+    never called this run (today's journaled spend already exceeds
+    daily_cost_cap_usd), only the unconditional stop-loss sweep and pending-
+    fill reconciliation ran. No `candidates`/`actions` here — there's
+    nothing to report from a call that never happened."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    positions_payload = _positions_payload(positions)
+    record = {
+        "timestamp": timestamp,
+        "env": ENV,
+        "type": "cost_cap_skip",
+        "run_mode": run_mode,
+        "breaker_status": breaker_status,
+        "sweep_results": sweep_results,
+        "fill_results": fill_results or [],
+        "positions": positions_payload,
+        "equity": equity,
+        "today_cost_usd": today_cost,
+        "daily_cost_cap_usd": cap,
+    }
+    _append(JOURNAL_PATH, json.dumps(record, default=str))
+    _append(
+        RUN_HISTORY_PATH,
+        f"{timestamp} env={ENV} type=cost_cap_skip run_mode={run_mode} breaker={breaker_status} "
+        f"today_cost={today_cost:.4f} cap={cap:.2f} sweep_events={len(sweep_results)} "
+        f"positions={len(positions_payload)} equity={equity:.2f}",
     )
     return record
 
