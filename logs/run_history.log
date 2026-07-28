@@ -28,3 +28,5 @@
 2026-07-28T00:14:56.220531+00:00 env=paper type=full_run regime=MIXED breaker=TRADING_OK candidates=12 approved=10 rejected=2 submitted=0 execution_rejected=0 fills_reconciled=0 fills_failed=0 fallback_hold=0 token_budget_warn=0 sweep_events=0 positions=1 equity=4999.98
 2026-07-28T14:44:59.572927+00:00 env=paper type=token_usage run_mode=LIGHT model=claude-haiku-4-5 input=2133 output=1102 cache_read=0 cache_write=0
 2026-07-28T14:44:59.602605+00:00 env=paper type=light_run regime=MIXED breaker=TRADING_OK candidates=1 approved=1 rejected=0 submitted=0 execution_rejected=0 fills_reconciled=0 fills_failed=0 fallback_hold=0 token_budget_warn=0 sweep_events=0 positions=1 equity=4999.98
+2026-07-28T18:06:43.689198+00:00 env=paper type=token_usage run_mode=LIGHT model=claude-haiku-4-5 input=2139 output=889 cache_read=0 cache_write=0
+2026-07-28T18:06:43.747550+00:00 env=paper type=light_run regime=MIXED breaker=TRADING_OK candidates=1 approved=1 rejected=0 submitted=0 execution_rejected=0 fills_reconciled=0 fills_failed=0 fallback_hold=0 token_budget_warn=0 sweep_events=0 positions=1 equity=4999.98
