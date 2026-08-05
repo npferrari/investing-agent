@@ -1,17 +1,1 @@
-[
-  {
-    "action": "BUY",
-    "decision_price": 377.74,
-    "decision_quote": {
-      "ask": 377.74,
-      "bid": 355.33,
-      "timestamp": "2026-08-04 20:04:46.196502+00:00"
-    },
-    "order_id": "382ef15e-b2f0-42f7-b415-1e3eb607acae",
-    "order_value": 350,
-    "sleeve": "MOMENTUM",
-    "submitted_at": "2026-08-05T00:18:45.598355+00:00",
-    "symbol": "GOOGL",
-    "usd_amount": 350
-  }
-]
+[]
