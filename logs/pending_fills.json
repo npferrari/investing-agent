@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "action": "TRIM",
+    "decision_price": 347.44,
+    "decision_quote": {
+      "ask": 347.53,
+      "bid": 347.44,
+      "timestamp": "2026-08-11 17:46:04.152481+00:00"
+    },
+    "order_id": "69efeb94-cbc7-4423-8a2e-636b53455d52",
+    "order_value": 150,
+    "sleeve": "QUALITY_VALUE",
+    "submitted_at": "2026-08-11T17:46:04.210960+00:00",
+    "symbol": "GOOGL",
+    "usd_amount": 150
+  }
+]
