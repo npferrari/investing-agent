@@ -1,17 +1,17 @@
 [
   {
     "action": "SELL",
-    "decision_price": 330.9,
+    "decision_price": 343.34,
     "decision_quote": {
-      "ask": 0.0,
-      "bid": 330.9,
-      "timestamp": "2026-08-11 20:00:01.581839+00:00"
+      "ask": 343.48,
+      "bid": 343.34,
+      "timestamp": "2026-08-12 13:53:26.494976+00:00"
     },
-    "order_id": "4829c6a8-a61a-4c48-99b0-1124858e0cd3",
-    "order_value": 165.99,
+    "order_id": "56914e57-5a5b-4002-9c1c-204806f182d0",
+    "order_value": 0.48,
     "sleeve": "MOMENTUM",
-    "submitted_at": "2026-08-12T00:03:30.641405+00:00",
+    "submitted_at": "2026-08-12T13:53:26.859987+00:00",
     "symbol": "GOOGL",
-    "usd_amount": 165.993436
+    "usd_amount": 0.481027
   }
 ]
