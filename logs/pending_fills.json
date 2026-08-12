@@ -1,17 +1,17 @@
 [
   {
-    "action": "TRIM",
-    "decision_price": 347.44,
+    "action": "SELL",
+    "decision_price": 330.9,
     "decision_quote": {
-      "ask": 347.53,
-      "bid": 347.44,
-      "timestamp": "2026-08-11 17:46:04.152481+00:00"
+      "ask": 0.0,
+      "bid": 330.9,
+      "timestamp": "2026-08-11 20:00:01.581839+00:00"
     },
-    "order_id": "69efeb94-cbc7-4423-8a2e-636b53455d52",
-    "order_value": 150,
-    "sleeve": "QUALITY_VALUE",
-    "submitted_at": "2026-08-11T17:46:04.210960+00:00",
+    "order_id": "4829c6a8-a61a-4c48-99b0-1124858e0cd3",
+    "order_value": 165.99,
+    "sleeve": "MOMENTUM",
+    "submitted_at": "2026-08-12T00:03:30.641405+00:00",
     "symbol": "GOOGL",
-    "usd_amount": 150
+    "usd_amount": 165.993436
   }
 ]
