@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "action": "BUY",
+    "decision_price": 167.98,
+    "decision_quote": {
+      "ask": 167.98,
+      "bid": 151.27,
+      "timestamp": "2026-08-17 20:00:00.010064+00:00"
+    },
+    "order_id": "b0e391c7-0e35-4fdf-b3cf-6561e7a22a1a",
+    "order_value": 350,
+    "sleeve": "MOMENTUM",
+    "submitted_at": "2026-08-17T23:42:56.625783+00:00",
+    "symbol": "XOM",
+    "usd_amount": 350
+  }
+]
