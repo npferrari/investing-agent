@@ -1,17 +1,17 @@
 [
   {
-    "action": "BUY",
-    "decision_price": 167.98,
+    "action": "TRIM",
+    "decision_price": 155.8,
     "decision_quote": {
-      "ask": 167.98,
-      "bid": 151.27,
-      "timestamp": "2026-08-17 20:00:00.010064+00:00"
+      "ask": 165.0,
+      "bid": 155.8,
+      "timestamp": "2026-08-18 17:17:00.007291+00:00"
     },
-    "order_id": "b0e391c7-0e35-4fdf-b3cf-6561e7a22a1a",
-    "order_value": 350,
+    "order_id": "3f94ebe3-1221-45b9-94bc-71f05c1dfe6d",
+    "order_value": 150,
     "sleeve": "MOMENTUM",
-    "submitted_at": "2026-08-17T23:42:56.625783+00:00",
+    "submitted_at": "2026-08-18T17:17:08.820866+00:00",
     "symbol": "XOM",
-    "usd_amount": 350
+    "usd_amount": 150
   }
 ]
