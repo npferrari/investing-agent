@@ -1,17 +1,1 @@
-[
-  {
-    "action": "BUY",
-    "decision_price": 524.75,
-    "decision_quote": {
-      "ask": 524.75,
-      "bid": 474.12,
-      "timestamp": "2026-09-02 20:00:02.379570+00:00"
-    },
-    "order_id": "9eab7f5d-e63f-4e65-a26a-cb68086d53dc",
-    "order_value": 150,
-    "sleeve": "MOMENTUM",
-    "submitted_at": "2026-09-03T01:12:40.843142+00:00",
-    "symbol": "MSFT",
-    "usd_amount": 150
-  }
-]
+[]
