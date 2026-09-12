@@ -225,3 +225,5 @@
 2026-09-11T16:37:13.097778+00:00 env=paper status=ERROR error=APIError('{"message":"backend request timeout"}\n')
 2026-09-11T19:24:21.446451+00:00 env=paper type=token_usage run_mode=LIGHT model=claude-haiku-4-5 input=17074 output=4930 cache_read=0 cache_write=0
 2026-09-11T19:24:21.509074+00:00 env=paper type=light_run regime=RISK_ON breaker=TRADING_OK candidates=3 approved=3 rejected=0 submitted=0 execution_rejected=0 fills_reconciled=0 fills_failed=0 fallback_hold=2 token_budget_warn=0 sweep_events=1 positions=5 equity=4949.49
+2026-09-12T01:14:52.977680+00:00 env=paper type=token_usage run_mode=FULL model=claude-sonnet-5 input=5091 output=4719 cache_read=0 cache_write=1619
+2026-09-12T01:14:53.153169+00:00 env=paper type=full_run regime=RISK_ON breaker=TRADING_OK candidates=12 approved=11 rejected=1 submitted=0 execution_rejected=0 fills_reconciled=0 fills_failed=0 fallback_hold=0 token_budget_warn=0 sweep_events=1 positions=5 equity=4948.09
