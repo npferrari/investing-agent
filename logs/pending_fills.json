@@ -1,17 +1,1 @@
-[
-  {
-    "action": "TRIM",
-    "decision_price": 215.7,
-    "decision_quote": {
-      "ask": 215.72,
-      "bid": 215.7,
-      "timestamp": "2026-09-16 17:10:18.227878+00:00"
-    },
-    "order_id": "f87beae1-541d-4709-b1e1-3220651dad20",
-    "order_value": 50,
-    "sleeve": "MOMENTUM",
-    "submitted_at": "2026-09-16T17:10:18.748661+00:00",
-    "symbol": "NVDA",
-    "usd_amount": 50
-  }
-]
+[]
