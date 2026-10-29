@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "action": "SELL",
+    "decision_price": 203.58,
+    "decision_quote": {
+      "ask": 225.12,
+      "bid": 203.58,
+      "timestamp": "2026-10-29 20:00:01.181769+00:00"
+    },
+    "order_id": "2e1cb2f4-2f3f-4cfc-8ac7-38fe5d386c3d",
+    "order_value": 257.52,
+    "sleeve": "MOMENTUM",
+    "submitted_at": "2026-10-29T21:29:45.896125+00:00",
+    "symbol": "NVDA",
+    "usd_amount": 257.524207
+  }
+]
