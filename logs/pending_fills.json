@@ -1,17 +1,17 @@
 [
   {
     "action": "SELL",
-    "decision_price": 203.58,
+    "decision_price": 202.44,
     "decision_quote": {
-      "ask": 225.12,
-      "bid": 203.58,
-      "timestamp": "2026-10-29 20:00:01.181769+00:00"
+      "ask": 202.47,
+      "bid": 202.44,
+      "timestamp": "2026-10-30 18:05:33.367564+00:00"
     },
-    "order_id": "2e1cb2f4-2f3f-4cfc-8ac7-38fe5d386c3d",
-    "order_value": 257.52,
+    "order_id": "4c5ba5e5-f3dd-49ca-bb95-90b7c332c9d6",
+    "order_value": 247.94,
     "sleeve": "MOMENTUM",
-    "submitted_at": "2026-10-29T21:29:45.896125+00:00",
+    "submitted_at": "2026-10-30T18:05:33.591685+00:00",
     "symbol": "NVDA",
-    "usd_amount": 257.524207
+    "usd_amount": 247.937495
   }
 ]
